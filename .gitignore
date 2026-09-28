@@ -1,0 +1,8 @@
+# Build outputs
+build/
+dd_gpu
+dd_cpu
+*.o
+*.dSYM/
+__pycache__/
+.DS_Store

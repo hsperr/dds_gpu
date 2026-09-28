@@ -1,0 +1,18 @@
+dds_gpu
+Copyright 2026 the dds_gpu authors
+
+This product includes code ported from DDS, the double-dummy solver by
+Bo Haglund and Soren Hein (https://github.com/dds-bridge/dds), licensed under
+the Apache License, Version 2.0. Copyright (C) Bo Haglund, Soren Hein.
+
+Ported or derived parts (see src/dd_bounds.h and src/dd.h):
+  - QuickTricks and QuickTricksSecondHand (DDS quick_tricks.cpp)
+  - LaterTricksMIN / LaterTricksMAX (DDS later_tricks.cpp)
+  - move-ordering weights for the lead and for 2nd/3rd/4th hand
+    (DDS heuristic_sorting.cpp)
+  - the partition-search idea of storing only the relevant ranks
+    ("win ranks") in the transposition table
+
+data/deals_20k.npy is a subset of the Pgx DDS dataset
+(https://huggingface.co/datasets/sotetsuk/dds_dataset) by the Pgx authors,
+licensed under the Apache License, Version 2.0.
