@@ -14,9 +14,10 @@ struct DDTop {
   int8_t win_h[4], win_c[4], sec_h[4], sec_c[4], thr_h[4], thr_c[4];  // hand -1 = no card
 };
 
-DD_FN void dd_top_init(DDTop& t, const uint64_t* hand) {
+// `lens` = dd_lengths(hand).
+DD_FN void dd_top_init(DDTop& t, const uint64_t* hand, uint64_t lens) {
   for (int h = 0; h < 4; h++)
-    for (int s = 0; s < 4; s++) t.len[h][s] = dd_popc(hand[h] & DD_SUIT(s));
+    for (int s = 0; s < 4; s++) t.len[h][s] = (int8_t)(lens >> (60 - 16 * h - 4 * s) & 15);
   for (int s = 0; s < 4; s++) {
     uint64_t a = (hand[0] | hand[1] | hand[2] | hand[3]) & DD_SUIT(s);
     int8_t* hs[3] = {&t.win_h[s], &t.sec_h[s], &t.thr_h[s]};

@@ -139,11 +139,17 @@ DD_FN void dd_suit_codes(const DDCtx& c, uint64_t* code) {
     code[s] = (pairs[s] & 0x3FFFFFF) | (1ull << (2 * dd_popc(all & DD_SUIT(s))));
 }
 
-DD_FN uint64_t dd_lengths(const DDCtx& c) {
+// All suit lengths, 4 bits per (hand, suit), hand 0 suit 0 highest. Counts per 16-bit
+// suit lane (SWAR popcount); one multiply gathers a hand's four counts into 16 bits.
+DD_FN uint64_t dd_lengths(const uint64_t* hand) {
   uint64_t k = 0;
-  for (int h = 0; h < 4; h++)
-    for (int s = 0; s < 4; s++)
-      k = (k << 4) | (uint64_t)dd_popc(c.hand[h] & DD_SUIT(s));
+  for (int h = 0; h < 4; h++) {
+    uint64_t x = hand[h] - ((hand[h] >> 1) & 0x5555555555555555ull);
+    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    x = (x + (x >> 8)) & 0x00FF00FF00FF00FFull;
+    k = (k << 16) | ((x * 0x1000010000100001ull) >> 48);
+  }
   return k;
 }
 
@@ -198,7 +204,7 @@ struct DDNode {  // trick-start data kept for the TT store
 
 DD_FN void dd_node_init(const DDCtx& c, DDNode& nd) {
   dd_suit_codes(c, nd.code);
-  nd.lens = dd_lengths(c);
+  nd.lens = dd_lengths(c.hand);
   nd.all = c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3];
   uint64_t h = dd_hash(nd.lens, c.leader);
   nd.bucket = c.tt + (h & c.tt_mask);
@@ -401,16 +407,23 @@ DD_FN int dd_moves(const DDCtx& c, int seat, int hint, const DDTop* top, int* ou
   DDFollow f;
   if (c.nplayed) dd_follow_init(f, c.hand, c.trump, c.leader, c.trick, c.nplayed);
 
+  // Skip cards whose next higher remaining card is of the same hand (equivalent). Each
+  // own card is flooded down through ranks no other hand holds; the flood reaches the
+  // own cards just below it. All suits at once (ranks 13..15 stop the flood).
+  uint64_t g = own, p = ~(all & ~own) & 0x1FFF1FFF1FFF1FFFull;
+  g |= p & (g >> 1);
+  p &= p >> 1;
+  g |= p & (g >> 2);
+  p &= p >> 2;
+  g |= p & (g >> 4);
+  p &= p >> 4;
+  g |= p & (g >> 8);
+
   int n = 0, score[13];
-  uint64_t rest = legal;
+  uint64_t rest = legal & ~(g >> 1);
   while (rest) {
     int card = dd_msb(rest);
     rest ^= 1ull << card;
-    int s = card >> 4;
-    // Skip cards touching a higher card of the same hand (equivalent).
-    uint64_t above = all & DD_SUIT(s) & ~((2ull << card) - 1);
-    if (above && (own & (1ull << dd_lsb(above)))) continue;
-
     int sc;
     if (c.nplayed == 0) {
       sc = dd_lead_weight(c.hand, *top, c.trump, c.left, seat, card,
@@ -492,7 +505,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
     c.enter_exit = 2;
     if (hit >= 0) return hit;
     f.ub = (int8_t)c.left;
-    dd_top_init(t, c.hand);
+    dd_top_init(t, c.hand, nd.lens);
     bool ns_lead = (c.leader & 1) == 0;
     int cut_ns = need, cut_ew = c.left - need + 1;
     uint64_t wr = 0;
@@ -529,7 +542,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
   else if (c.nplayed == 1) {
     uint64_t th[4] = {c.hand[0], c.hand[1], c.hand[2], c.hand[3]};
     th[c.leader] |= 1ull << c.trick[0];
-    dd_top_init(t, th);
+    dd_top_init(t, th, dd_lengths(th));
     int second = (c.leader + 1) & 3;
     int need2 = target - c.ns_won;
     int cutoff = (second & 1) == 0 ? need2 : c.left - need2 + 1;
