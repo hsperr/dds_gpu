@@ -54,14 +54,14 @@ DD_FN int dd_owner(const uint64_t* hand, int card) {
 #define DD_TT_WAYS 16
 #define DD_GEN_BITS 6
 
-// Exactness of the packed entry: dd_hash is a bijection of lens ^ (leader << 62) (odd
+// Exactness of the default packed entry: dd_hash is a bijection of lens ^ (leader << 62) (odd
 // multiplies and xorshifts are invertible), so with the leader known, the 64 hash bits
 // identify the suit lengths. The bucket index holds hash bits 0..TT_LOG2-1, the tag bits
-// 44..63, the entry q = bits 9..43. Bucket, tag and q together fix the lengths exactly, so
+// 48..63, the entry q = bits 9..47. Bucket, tag and q together fix the lengths exactly, so
 // they are not stored; this needs TT_LOG2 >= 9.
-#define DD_Q_BITS 35
+#define DD_Q_BITS 39
 #define DD_TT_MIN_LOG2 9
-#define DD_MAX_REL 24  // relevant cards one entry can hold
+#define DD_MAX_REL 29  // relevant cards one entry can hold
 
 #ifdef DD_SHARED_TT
 // TT entry, 32 bytes (the shared TT keeps the plain layout, see dd_tt_probe).
@@ -71,11 +71,24 @@ DD_FN int dd_owner(const uint64_t* hand, int card) {
 struct DDEntry {
   uint64_t pat0, pat1, lens, meta;
 };
+#elif defined(DD_TT_SIG)
+// TT entry, 12 bytes (-DDD_TT_SIG). Instead of the key (owner patterns of the relevant
+// cards, suit lengths, leader) it keeps a 64-bit hash of it, so it is not strictly exact:
+// a wrong hit needs two different keys with the same tag and the same 64-bit hash.
+//   meta: relevant-card counts n0..n3 (4 bits each) | lb (4) | ub (4) | best card (6, 63 = none)
+struct DDEntry {
+  uint32_t sig_lo, sig_hi, meta;
+#ifdef DD_VERIFY
+  uint64_t dbg_hand[4], dbg_rel;
+  int dbg_leader, dbg_lb, dbg_ub;
+#endif
+};
 #else
-// TT entry, 16 bytes. A bucket is DD_TT_WAYS entries with the same hash.
-//   w0: q (35) | lb (4) | ub (4) | best card (6, 63 = none) | unused (15)
-//   w1: relevant-card counts n0..n3 (4 bits each) | owners (2 bits per relevant card, suit 0
-//       first, high card first: bit 0 = E or W, bit 1 = S or W), up to 24 cards
+// TT entry, 16 bytes, exact (default). A bucket is DD_TT_WAYS entries with the same hash.
+//   w0: q (39) | lb (4) | ub (4) | best card (6, 63 = none) | owners, bits 48..58 (11)
+//   w1: relevant-card counts n0..n3 (4 bits each) | owners, bits 0..47
+//   owners: 2 bits per relevant card, suit 0 first, high card first (bit 0 = E or W,
+//   bit 1 = S or W), up to 29 cards
 // The generation and the leader live in the tag only.
 struct DDEntry {
   uint64_t w0, w1;
@@ -87,9 +100,11 @@ struct DDEntry {
 #endif
 
 // Tags come first so a probe reads one 64-byte line unless a tag matches.
-//   tag: hash bits 44..63 (20) | way of its entry (4) | gen (6) | leader (2); 0 = empty.
-// Tags are kept newest first; entries stay in place, so a store rewrites one 64-byte line
-// of tags instead of moving the whole bucket.
+//   tag: hash bits 48..63 (16) | tricks left (4) | way of its entry (4) | gen (6) |
+//        leader (2); 0 = empty.
+// Tags are kept in age order, newest first; entries stay in place, so a store rewrites one
+// 64-byte line of tags instead of moving the whole bucket, and picks its victim from the
+// tag line alone.
 struct DDBucket {
   uint32_t tag[DD_TT_WAYS];
   DDEntry e[DD_TT_WAYS];
@@ -224,7 +239,8 @@ DD_FN void dd_node_init(const DDCtx& c, DDNode& nd) {
   uint64_t h = dd_hash(nd.lens, c.leader);
   nd.bucket = c.tt + (h & c.tt_mask);
   nd.q = (h >> 9) & ((1ull << DD_Q_BITS) - 1);
-  nd.tag = ((uint32_t)(h >> 32) & 0xFFFFF000u) | (DD_KEY(c) << 2) | (uint32_t)c.leader;
+  nd.tag = ((uint32_t)(h >> 32) & 0xFFFF0000u) | ((uint32_t)c.left << 12) | (DD_KEY(c) << 2) |
+           (uint32_t)c.leader;
 }
 
 #ifdef DD_SHARED_TT
@@ -306,8 +322,123 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
   tags[victim] = nd.tag;
 }
 #else
-// Packs the owner patterns of the relevant cards into w1; false if there are too many.
-DD_FN bool dd_pack(const DDNode& nd, uint64_t rel, uint64_t* w1) {
+// Takes a way for a new entry and puts its tag in front. When the bucket is full, the
+// victim is the tag with the least value, 2 * tricks left + age rank (0 = oldest), so
+// entries that saved deep searches stay longer; tags of dead generations go first. Tags in
+// front of it move back by one and its entry way is reused. Tags are never cleared one by
+// one, so while the bucket is not full the used ways are 0..n-1.
+DD_FN int dd_tt_slot(const DDCtx& c, DDBucket* b, uint32_t tag) {
+  int way, pos = DD_TT_WAYS - 1;
+  if (b->tag[DD_TT_WAYS - 1]) {
+    int least = 99;
+    for (int p = DD_TT_WAYS - 1; p >= 0; p--) {
+      uint32_t t = b->tag[p];
+      int v = ((t >> 2) & 63) != c.gen ? -1 : 2 * (int)((t >> 12) & 15) + DD_TT_WAYS - 1 - p;
+      if (v < least) {
+        least = v;
+        pos = p;
+      }
+    }
+    way = (b->tag[pos] >> 8) & 15;
+  } else {
+    way = 0;
+    while (b->tag[way]) way++;
+  }
+  for (int i = pos; i > 0; i--) b->tag[i] = b->tag[i - 1];
+  b->tag[0] = tag | ((uint32_t)way << 8);
+  return way;
+}
+
+#ifdef DD_TT_SIG
+DD_FN uint64_t dd_mix(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 27;
+  x *= 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
+// Hash of the key: owner patterns p[0..3] (leading 1 bit each), suit lengths, tag.
+DD_FN uint64_t dd_sig(const DDNode& nd, const uint64_t* p) {
+  uint64_t h = dd_mix((p[0] | p[1] << 27) + 0x9E3779B97F4A7C15ull);
+  h = dd_mix(h ^ (p[2] | p[3] << 27));
+  return dd_mix(h ^ nd.lens) ^ nd.tag;
+}
+
+// Looks up bounds of NS tricks still to win. Returns 1 true, 0 false, -1 unknown.
+DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel, int* best) {
+  uint32_t ways = 0;  // ways whose tag matches, found with a fixed loop
+  for (int i = 0; i < DD_TT_WAYS; i++)
+    ways |= (uint32_t)((nd.bucket->tag[i] & ~0xF00u) == nd.tag) << i;
+  for (; ways; ways &= ways - 1) {
+    const DDEntry& e = nd.bucket->e[(nd.bucket->tag[dd_lsb(ways)] >> 8) & 15];
+    uint64_t p[4];
+    int n[4];
+    bool fit = true;
+    for (int s = 0; s < 4; s++) {
+      n[s] = (int)(e.meta >> (4 * s)) & 15;
+      int len = dd_pattern_len(nd.code[s]);
+      fit &= n[s] <= len;
+      p[s] = fit ? nd.code[s] >> (2 * (len - n[s])) : 0;
+    }
+    if (!fit) continue;
+    uint64_t sig = dd_sig(nd, p);
+    if (e.sig_lo != (uint32_t)sig || e.sig_hi != (uint32_t)(sig >> 32)) continue;
+    int lb = (int)(e.meta >> 16) & 15, ub = (int)(e.meta >> 20) & 15;
+    if (lb >= need || ub < need) {
+      uint64_t r = 0;
+      for (int s = 0; s < 4; s++) r |= dd_top_cards(nd.all, s, n[s]);
+      *rel = r;
+      return lb >= need;
+    }
+    int b = (int)(e.meta >> 24) & 63;
+    if (b != 63) *best = b;
+  }
+  return -1;
+}
+
+DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub, int best) {
+#ifdef DD_VERIFY
+  if (c.no_tt) return;
+#endif
+  uint64_t p[4];
+  uint32_t counts = 0;
+  for (int s = 0; s < 4; s++) {
+    p[s] = dd_pattern(nd.code[s], nd.all, rel, s);
+    counts |= (uint32_t)dd_pattern_len(p[s]) << (4 * s);
+  }
+  uint64_t sig = dd_sig(nd, p);
+  DDBucket* b = nd.bucket;
+  DDEntry* e = 0;
+  for (int i = 0; i < DD_TT_WAYS && !e; i++) {
+    uint32_t t = b->tag[i];
+    if ((t & ~0xF00u) != nd.tag) continue;
+    DDEntry& x = b->e[(t >> 8) & 15];
+    if (x.sig_lo == (uint32_t)sig && x.sig_hi == (uint32_t)(sig >> 32) &&
+        (x.meta & 0xFFFF) == counts) {
+      int olb = (int)(x.meta >> 16) & 15, oub = (int)(x.meta >> 20) & 15;
+      int obest = (int)(x.meta >> 24) & 63;
+      if (olb > lb) lb = olb;
+      if (oub < ub) ub = oub;
+      if (best < 0 && obest != 63) best = obest;
+      e = &x;
+    }
+  }
+  if (!e) {
+    e = &b->e[dd_tt_slot(c, b, nd.tag)];
+    e->sig_lo = (uint32_t)sig;
+    e->sig_hi = (uint32_t)(sig >> 32);
+  }
+  e->meta = counts | (uint32_t)lb << 16 | (uint32_t)ub << 20 | (uint32_t)(best < 0 ? 63 : best) << 24;
+#ifdef DD_VERIFY
+  for (int h = 0; h < 4; h++) e->dbg_hand[h] = c.hand[h];
+  e->dbg_rel = rel; e->dbg_leader = c.leader; e->dbg_lb = lb; e->dbg_ub = ub;
+#endif
+}
+#else
+// Packs the owner patterns of the relevant cards into w1 and the top bits of w0 (`hi`);
+// false if there are too many.
+DD_FN bool dd_pack(const DDNode& nd, uint64_t rel, uint64_t* w1, uint64_t* hi) {
   uint64_t counts = 0, owners = 0;
   int total = 0;
   for (int s = 0; s < 4; s++) {
@@ -319,6 +450,7 @@ DD_FN bool dd_pack(const DDNode& nd, uint64_t rel, uint64_t* w1) {
     total += n;
   }
   *w1 = counts | owners << 16;
+  *hi = owners >> 48 << 53;
   return true;
 }
 
@@ -330,12 +462,13 @@ DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel,
   for (; ways; ways &= ways - 1) {
     const DDEntry& e = nd.bucket->e[(nd.bucket->tag[dd_lsb(ways)] >> 8) & 15];
     if ((e.w0 & ((1ull << DD_Q_BITS) - 1)) != nd.q) continue;
-    int n[4], off = 16;
+    uint64_t owners = e.w1 >> 16 | e.w0 >> 53 << 48;
+    int n[4], off = 0;
     bool match = true;
     for (int s = 0; s < 4; s++) {
       n[s] = (int)(e.w1 >> (4 * s)) & 15;
       int len = dd_pattern_len(nd.code[s]);
-      uint64_t p = (e.w1 >> off & ((1ull << (2 * n[s])) - 1)) | (1ull << (2 * n[s]));
+      uint64_t p = (owners >> off & ((1ull << (2 * n[s])) - 1)) | (1ull << (2 * n[s]));
       match &= n[s] <= len && (nd.code[s] >> (2 * (len - n[s]))) == p;
       off += 2 * n[s];
     }
@@ -359,29 +492,29 @@ DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel,
   return -1;
 }
 
-DD_FN uint64_t dd_pack_w0(const DDNode& nd, int lb, int ub, int best) {
+DD_FN uint64_t dd_pack_w0(const DDNode& nd, int lb, int ub, int best, uint64_t hi) {
   return nd.q | (uint64_t)lb << DD_Q_BITS | (uint64_t)ub << (DD_Q_BITS + 4) |
-         (uint64_t)(best < 0 ? 63 : best) << (DD_Q_BITS + 8);
+         (uint64_t)(best < 0 ? 63 : best) << (DD_Q_BITS + 8) | hi;
 }
 
 DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub, int best) {
 #ifdef DD_VERIFY
   if (c.no_tt) return;
 #endif
-  uint64_t w1;
-  if (!dd_pack(nd, rel, &w1)) return;  // too many relevant cards: not stored
+  uint64_t w1, hi;
+  if (!dd_pack(nd, rel, &w1, &hi)) return;  // too many relevant cards: not stored
   DDBucket* b = nd.bucket;
   for (int i = 0; i < DD_TT_WAYS; i++) {
     uint32_t t = b->tag[i];
     if ((t & ~0xF00u) != nd.tag) continue;
     DDEntry& e = b->e[(t >> 8) & 15];
-    if ((e.w0 & ((1ull << DD_Q_BITS) - 1)) == nd.q && e.w1 == w1) {
+    if ((e.w0 & ((1ull << DD_Q_BITS) - 1)) == nd.q && e.w1 == w1 && e.w0 >> 53 << 53 == hi) {
       int olb = (int)(e.w0 >> DD_Q_BITS) & 15, oub = (int)(e.w0 >> (DD_Q_BITS + 4)) & 15;
       int obest = (int)(e.w0 >> (DD_Q_BITS + 8)) & 63;
       if (olb > lb) lb = olb;
       if (oub < ub) ub = oub;
       if (best < 0 && obest != 63) best = obest;
-      e.w0 = dd_pack_w0(nd, lb, ub, best);
+      e.w0 = dd_pack_w0(nd, lb, ub, best, hi);
 #ifdef DD_VERIFY
       for (int h = 0; h < 4; h++) e.dbg_hand[h] = c.hand[h];
       e.dbg_rel = rel; e.dbg_leader = c.leader; e.dbg_lb = lb; e.dbg_ub = ub;
@@ -389,26 +522,15 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
       return;
     }
   }
-  // New tags go in front; the last tag falls out and its entry way is reused. Tags are
-  // never cleared one by one, so while the bucket is not full the used ways are 0..n-1.
-  uint32_t last = b->tag[DD_TT_WAYS - 1];
-  int way;
-  if (last) {
-    way = (last >> 8) & 15;
-  } else {
-    way = 0;
-    while (b->tag[way]) way++;
-  }
-  for (int i = DD_TT_WAYS - 1; i > 0; i--) b->tag[i] = b->tag[i - 1];
-  b->tag[0] = nd.tag | ((uint32_t)way << 8);
-  DDEntry& e = b->e[way];
-  e.w0 = dd_pack_w0(nd, lb, ub, best);
+  DDEntry& e = b->e[dd_tt_slot(c, b, nd.tag)];
+  e.w0 = dd_pack_w0(nd, lb, ub, best, hi);
   e.w1 = w1;
 #ifdef DD_VERIFY
   for (int h = 0; h < 4; h++) e.dbg_hand[h] = c.hand[h];
   e.dbg_rel = rel; e.dbg_leader = c.leader; e.dbg_lb = lb; e.dbg_ub = ub;
 #endif
 }
+#endif  // DD_TT_SIG
 
 #endif
 

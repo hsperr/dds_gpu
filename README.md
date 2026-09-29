@@ -19,11 +19,21 @@ header-only core also builds for the CPU, which is how it is tested.
   so a probe normally touches one 64-byte line. Tags are kept newest first and each tag
   names the way of its entry, so a store shifts only the tag line, not the whole bucket
   (+9% full deals/s, +22% on 8-card endings on an RTX 4070 Ti SUPER; same node counts).
-- **16-byte entries.** An entry keeps 35 bits of the suit-length hash instead of the
-  lengths (the hash is a bijection, so bucket + tag + those bits identify the lengths
-  exactly), no generation or leader (the tag has them), and the owner patterns as counts plus
-  concatenated owner bits (up to 24 relevant cards; a store with more is skipped). A bucket
-  is 320 bytes. The shared-TT build keeps the 32-byte entry (576-byte buckets).
+- **16-byte entries (default, exact).** An entry keeps 39 bits of the suit-length hash
+  instead of the lengths (the hash is a bijection, so bucket + tag + those bits identify the
+  lengths exactly), no generation or leader (the tag has them), and the owner patterns as
+  counts plus concatenated owner bits (up to 29 relevant cards; a store with more is
+  skipped). A bucket is 320 bytes.
+- **12-byte entries (`-DDD_TT_SIG`, not strictly exact).** An entry keeps a 64-bit hash of
+  its key (owner patterns, suit lengths, tag) plus the relevant-card counts, so there is no
+  card limit. A wrong hit needs two keys with the same tag and the same 64-bit hash. A
+  bucket is 256 bytes. Fewer nodes and faster than the default (see Results).
+- **Eviction by depth.** Each tag also holds the tricks left of its entry. A new entry in a
+  full bucket replaces the tag with the least 2 x tricks left + age rank (old generations
+  first), so entries that saved deep searches stay longer. The choice reads only the tag
+  line. At 2^9 buckets this alone cuts nodes from 80M to 35M per deal (CPU, 8 deals).
+- The shared-TT build (`-DDD_SHARED_TT`) keeps the 32-byte entry (576-byte buckets) and
+  in-place replacement.
 - **DDS bounds and move ordering.** QuickTricks, QuickTricksSecondHand, LaterTricks and the
   DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`), kept close to the
   original so the two can be compared.
@@ -85,8 +95,9 @@ nvcc -O3 -std=c++17 -arch=sm_120 -Isrc -o dd_gpu gpu/gpu_main.cu
 nvcc -O3 -std=c++17 -arch=sm_120 -Isrc -o dd_stream gpu/stream_main.cu
 ```
 
-Add `-DDD_SHARED_TT` for the shared-TT experiment (see below). The default build uses one
-TT per thread.
+Add `-DDD_TT_SIG` for the 12-byte hash entries (faster, not strictly exact; e.g.
+`make gpu SM=89 NVFLAGS=-DDD_TT_SIG`), or `-DDD_SHARED_TT` for the shared-TT experiment (see
+below). The default build uses one exact TT per thread.
 
 ## Run
 
@@ -251,6 +262,21 @@ RTX 4070 Ti SUPER, defaults, 120 s of full deals:
 | + owners, suit codes, TT probe, move skips with bit operations (no loops over cards) | **59.5** | **13,299** | 0 wrong of 168,668 |
 
 Node counts are the same in all three; only the work per node changed.
+
+TT layout and eviction, on a second RTX 4070 Ti SUPER box (slower: the same code runs 47.8
+there vs 59.5 above), 120 s of full deals, 32,768 threads. Nodes: CPU, first 8 deals of
+`data/deals_20k.npy`, same bucket count:
+
+| TT | Per thread | Full deals/s | Nodes/deal | Check |
+|---|---|---|---|---|
+| 32-byte entries, FIFO | 288 KB | 47.8 | 80.2M | 0 wrong of 138,045 |
+| 16-byte entries (24 cards), FIFO | 320 KB | 52.8 | 59.2M | 0 wrong of 150,445 |
+| 32-byte entries, eviction by depth (read from entries) | 288 KB | 54.3 | 35.0M | 0 wrong of 148,981 |
+| **16-byte entries (29 cards), eviction by depth (default)** | 320 KB | **59.9** | 37.6M | 0 wrong of 164,366 |
+| **12-byte hash entries, eviction by depth (`-DDD_TT_SIG`)** | 256 KB | **62.8** | 24.7M | 0 wrong of 169,729 |
+
+The card limit of the exact entry costs a lot once eviction keeps deep entries: 32-byte
+entries with eviction and the same 29-card limit need exactly as many nodes as the default.
 
 Profile of the wavefront kernel on full deals (`-DDD_PROFILE`; Nsight Compute could not be
 used because the vast.ai container blocks GPU performance counters, `ERR_NVGPUCTRPERM`):

@@ -2,9 +2,11 @@
 #   make            CPU solver + test and bench tools into build/
 #   make check      run tests/check.sh
 #   make gpu SM=120 CUDA batch + streaming drivers (SM = compute capability, e.g. 89, 90, 120)
+#                   NVFLAGS=-DDD_TT_SIG for the 12-byte hash TT entries
 CXX ?= c++
 CXXFLAGS ?= -O3 -std=c++17 -march=native -pthread
 SM ?= 120
+NVFLAGS ?=
 HDR := $(wildcard src/*.h)
 B := build
 
@@ -26,9 +28,9 @@ pbn: $(B)/pbn
 
 gpu: $(B)/dd_gpu $(B)/dd_stream
 $(B)/dd_gpu: gpu/gpu_main.cu $(HDR) | $(B)
-	nvcc -O3 -std=c++17 -arch=sm_$(SM) -Isrc -o $@ $<
+	nvcc -O3 -std=c++17 -arch=sm_$(SM) $(NVFLAGS) -Isrc -o $@ $<
 $(B)/dd_stream: gpu/stream_main.cu $(HDR) | $(B)
-	nvcc -O3 -std=c++17 -arch=sm_$(SM) -Isrc -o $@ $<
+	nvcc -O3 -std=c++17 -arch=sm_$(SM) $(NVFLAGS) -Isrc -o $@ $<
 
 check:
 	tests/check.sh
