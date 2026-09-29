@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
   if (file_mode) {
     long start = atol(argv[2]);
     n = atol(argv[3]);
-    tt_log2 = argc > 4 ? atoi(argv[4]) : 9;
+    tt_log2 = argc > 4 ? atoi(argv[4]) : 10;
     PgxDeals d;
     if (!pgx_load(argv[1], start, n, &d)) { fprintf(stderr, "cannot load\n"); return 1; }
     hands.resize(n * 4);
@@ -191,6 +191,10 @@ int main(int argc, char** argv) {
     random_deals(k, n, hands);
   }
 
+  if (tt_log2 < DD_TT_MIN_LOG2) {
+    fprintf(stderr, "TT_LOG2 must be >= %d\n", DD_TT_MIN_LOG2);
+    return 2;
+  }
   long jobs = n * 5;
   long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 32768;
   if (threads > jobs) threads = jobs;

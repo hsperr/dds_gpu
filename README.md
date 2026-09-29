@@ -19,6 +19,11 @@ header-only core also builds for the CPU, which is how it is tested.
   so a probe normally touches one 64-byte line. Tags are kept newest first and each tag
   names the way of its entry, so a store shifts only the tag line, not the whole bucket
   (+9% full deals/s, +22% on 8-card endings on an RTX 4070 Ti SUPER; same node counts).
+- **16-byte entries.** An entry keeps 35 bits of the suit-length hash instead of the
+  lengths (the hash is a bijection, so bucket + tag + those bits identify the lengths
+  exactly), no generation or leader (the tag has them), and the owner patterns as counts plus
+  concatenated owner bits (up to 24 relevant cards; a store with more is skipped). A bucket
+  is 320 bytes. The shared-TT build keeps the 32-byte entry (576-byte buckets).
 - **DDS bounds and move ordering.** QuickTricks, QuickTricksSecondHand, LaterTricks and the
   DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`), kept close to the
   original so the two can be compared.
@@ -96,7 +101,7 @@ Environment:
 
 - `WAVE=1` selects the wavefront kernel (the fast one). Without it the plain kernel runs.
 - `THREADS` number of GPU threads (default 32768). Each thread has its own TT of
-  `2^TT_LOG2` buckets (576 bytes each, so the default TT_LOG2=9 is 288 KB per thread).
+  `2^TT_LOG2` buckets (320 bytes each, so the default TT_LOG2=10 is 320 KB per thread; TT_LOG2 >= 9).
 - `STACK_KB` per-thread stack limit (default 8). CUDA reserves this for every resident
   thread, so keep it small; the iterative search needs about 4 KB.
 - `TIME_LIMIT` seconds (wavefront kernel only). After the limit, threads stop cleanly and
@@ -123,7 +128,7 @@ GPU streaming:
   input index (0-based) + 20 bytes `tricks[strain C,D,H,S,NT][declarer N,E,S,W]`.
 - `bench` streams random full deals for SECONDS, prints deals/s every 10 s, and re-solves
   every CHECK_EVERY-th deal (default 50) on CPU threads to check it.
-- `TT_LOG2` default 9. Env: `THREADS` (default 32768), `STACK_KB` (default 8), `PER_LEAD=1` (20 jobs per deal,
+- `TT_LOG2` default 10 (minimum 9). Env: `THREADS` (default 32768), `STACK_KB` (default 8), `PER_LEAD=1` (20 jobs per deal,
   one per lead, instead of 5 per-strain jobs where the 4 leads share the TT).
 - With `-DDD_SHARED_TT`, TT_LOG2 is the total bucket count of the one shared TT
   (e.g. 24 = 9.7 GB).

@@ -17,6 +17,10 @@ int main(int argc, char** argv) {
   long start = atol(argv[2]), count = atol(argv[3]);
   int threads = argc > 4 ? atoi(argv[4]) : (int)std::thread::hardware_concurrency();
   int tt_log2 = argc > 5 ? atoi(argv[5]) : 18;
+  if (tt_log2 < DD_TT_MIN_LOG2) {
+    fprintf(stderr, "TT_LOG2 must be >= %d\n", DD_TT_MIN_LOG2);
+    return 2;
+  }
   // GUESS=exact: start from the true answer; GUESS=off1: true answer +-1 (alternating).
   const char* guess_mode = getenv("GUESS") ? getenv("GUESS") : "";
   PgxDeals d;

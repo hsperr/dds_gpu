@@ -120,7 +120,11 @@ static void random_deal(std::mt19937_64& rng, uint64_t* h) {
 int main(int argc, char** argv) {
   bool bench = argc > 1 && !strcmp(argv[1], "bench");
   double seconds = bench && argc > 2 ? atof(argv[2]) : 0;
-  int tt_log2 = bench && argc > 3 ? atoi(argv[3]) : 9;
+  int tt_log2 = bench && argc > 3 ? atoi(argv[3]) : 10;
+  if (tt_log2 < DD_TT_MIN_LOG2) {
+    fprintf(stderr, "TT_LOG2 must be >= %d\n", DD_TT_MIN_LOG2);
+    return 2;
+  }
   long check_every = bench && argc > 4 ? atol(argv[4]) : 50;
   long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 32768;
   threads = (threads + 63) / 64 * 64;
