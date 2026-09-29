@@ -20,10 +20,6 @@ nvcc -O3 -std=c++17 -arch=sm_\$ARCH -Xptxas -v -o dd_gpu gpu_main.cu 2>&1 | grep
 
 echo "== endings (checked against the CPU on the same box)"
 WAVE=1 STACK_KB=8 ./dd_gpu 8 20000 9 300
-echo "== full deals (checked against the Pgx tables)"
-for cfg in "16384 10" "8192 11" "6144 12"; do
-  set -- \$cfg
-  echo "-- THREADS=\$1 tt_log2=\$2"
-  WAVE=1 STACK_KB=8 TIME_LIMIT=120 THREADS=\$1 ./dd_gpu deals_20k.npy 0 \$((\$1 / 5 * 2)) \$2
-done
+echo "== full deals, 120 s (checked against the Pgx tables)"
+WAVE=1 STACK_KB=8 TIME_LIMIT=120 ./dd_gpu deals_20k.npy 0 20000 | grep -v "jobs done"
 EOF

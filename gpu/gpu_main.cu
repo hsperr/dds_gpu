@@ -1,7 +1,9 @@
 // GPU run: one thread per (deal, strain) solve, each with its own TT slice.
 //   ./dd_gpu K DEALS [TT_LOG2] [CHECK]     random K-card endings, CHECK solves re-done on CPU
 //   ./dd_gpu FILE.npy START DEALS [TT_LOG2] full Pgx deals, checked against the file
-// Env: WAVE=1 wavefront kernel, THREADS, STACK_KB (default 8), TIME_LIMIT (seconds, WAVE only).
+// Env: WAVE=1 wavefront kernel, THREADS (default 32768), STACK_KB (default 8), TIME_LIMIT
+// (seconds, WAVE only), CHEAP_LOOP=1 (run cheap stages back to back; no gain measured).
+// Build with -DDD_PROFILE for per-stage cycle / active-lane counters (WAVE only).
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,12 +49,19 @@ __global__ void solve_kernel(const uint64_t* hands, long jobs, DDBucket* tt, int
   atomicAdd(nodes, (unsigned long long)c.nodes);
 }
 
+#ifdef DD_PROFILE
+// Per stage: [0..5] warp cycles, [8..13] warp iterations, [16..21] active lanes summed;
+// [24..30] how often dd_enter left at each exit point (see enter_exit in dd.h).
+__device__ unsigned long long g_prof[32];
+#endif
+
 // Wavefront kernel: every thread runs its own solve as a stage machine, but the warp runs
 // one stage at a time for all threads in it. Cheap stages go first, so threads gather at
 // the expensive ENTER stage and run it together instead of diverging.
 __global__ void wave_kernel(const uint64_t* hands, long jobs, DDBucket* tt, int tt_log2,
                             int* out, unsigned long long* nodes, unsigned long long* next,
-                            volatile unsigned long long* done, volatile int* stop) {
+                            volatile unsigned long long* done, volatile int* stop,
+                            int cheap_loop) {
   long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
   DDWave w;
   memset(&w.c, 0, sizeof(w.c));
@@ -62,28 +71,80 @@ __global__ void wave_kernel(const uint64_t* hands, long jobs, DDBucket* tt, int 
     for (int k = 0; k < DD_TT_WAYS; k++) w.c.tt[i].tag[k] = 0;
   w.hands = hands;
   w.out = out;
+  w.jobs = jobs;
   w.ring = jobs / 5;
   w.work = 0;
   w.jpd = 5;
-  w.jobs = jobs;
   w.stage = DD_S_JOB;
   auto take = [&] { return (long)atomicAdd(next, 1ull); };
   const unsigned all = 0xffffffffu;
   unsigned steps = 0;
+#ifdef DD_PROFILE
+  unsigned long long prof_cyc[DD_S_COUNT] = {0}, prof_it[DD_S_COUNT] = {0},
+                     prof_lanes[DD_S_COUNT] = {0}, prof_exit[7] = {0};
+#endif
   while (__ballot_sync(all, w.stage == DD_S_EXIT) != all) {
     if ((++steps & 4095) == 0 && *stop) w.stage = DD_S_EXIT;  // host time limit
+    if (cheap_loop) {
+      // Cheap stages run back to back until the thread reaches ENTER (or runs out of
+      // jobs); then the warp runs ENTER for everyone at once.
+      bool cheap = w.stage == DD_S_RET || w.stage == DD_S_NEXT || w.stage == DD_S_ROOT ||
+                   w.stage == DD_S_JOB;
+      if (__ballot_sync(all, cheap)) {
+#ifdef DD_PROFILE
+        long long t_start = clock64();
+#endif
+        while (w.stage == DD_S_RET || w.stage == DD_S_NEXT || w.stage == DD_S_ROOT ||
+               w.stage == DD_S_JOB) {
+          int before = w.stage;
+          dd_wave_step(w, take);
+          if (before != DD_S_JOB && w.stage == DD_S_JOB)
+            atomicAdd((unsigned long long*)done, 1ull);  // a job just finished
+        }
+#ifdef DD_PROFILE
+        unsigned act = __ballot_sync(all, cheap);
+        if ((threadIdx.x & 31) == 0) {
+          prof_cyc[DD_S_NEXT] += clock64() - t_start;
+          prof_it[DD_S_NEXT]++;
+          prof_lanes[DD_S_NEXT] += __popc(act);
+        }
+#endif
+        continue;
+      }
+    }
     int pick;
     if (__ballot_sync(all, w.stage == DD_S_RET)) pick = DD_S_RET;
     else if (__ballot_sync(all, w.stage == DD_S_NEXT)) pick = DD_S_NEXT;
     else if (__ballot_sync(all, w.stage == DD_S_ROOT)) pick = DD_S_ROOT;
     else if (__ballot_sync(all, w.stage == DD_S_JOB)) pick = DD_S_JOB;
     else pick = DD_S_ENTER;
+#ifdef DD_PROFILE
+    long long t_start = clock64();
+    bool ran = w.stage == pick;
+#endif
     if (w.stage == pick) {
       dd_wave_step(w, take);
       if (pick != DD_S_JOB && w.stage == DD_S_JOB)
         atomicAdd((unsigned long long*)done, 1ull);  // a job just finished
     }
+#ifdef DD_PROFILE
+    unsigned act = __ballot_sync(all, ran);
+    if ((threadIdx.x & 31) == 0) {
+      prof_cyc[pick] += clock64() - t_start;
+      prof_it[pick]++;
+      prof_lanes[pick] += __popc(act);
+    }
+    if (ran && pick == DD_S_ENTER) prof_exit[w.c.enter_exit]++;
+#endif
   }
+#ifdef DD_PROFILE
+  for (int i = 0; i < DD_S_COUNT; i++) {
+    atomicAdd(&g_prof[i], prof_cyc[i]);
+    atomicAdd(&g_prof[8 + i], prof_it[i]);
+    atomicAdd(&g_prof[16 + i], prof_lanes[i]);
+  }
+  for (int i = 0; i < 7; i++) atomicAdd(&g_prof[24 + i], prof_exit[i]);
+#endif
   atomicAdd(nodes, (unsigned long long)w.c.nodes);
 }
 
@@ -112,7 +173,7 @@ int main(int argc, char** argv) {
   if (file_mode) {
     long start = atol(argv[2]);
     n = atol(argv[3]);
-    tt_log2 = argc > 4 ? atoi(argv[4]) : 10;
+    tt_log2 = argc > 4 ? atoi(argv[4]) : 9;
     PgxDeals d;
     if (!pgx_load(argv[1], start, n, &d)) { fprintf(stderr, "cannot load\n"); return 1; }
     hands.resize(n * 4);
@@ -131,7 +192,7 @@ int main(int argc, char** argv) {
   }
 
   long jobs = n * 5;
-  long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 16384;
+  long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 32768;
   if (threads > jobs) threads = jobs;
   threads = (threads + 63) / 64 * 64;  // whole blocks; spare threads find no job
   size_t tt_bytes = (size_t)threads * sizeof(DDBucket) * ((size_t)1 << tt_log2);
@@ -158,6 +219,7 @@ int main(int argc, char** argv) {
 
   int block = 64;
   long grid = (threads + block - 1) / block;
+  unsigned long long* h_done_ptr = nullptr;
   auto t0 = std::chrono::steady_clock::now();
   bool wave = getenv("WAVE") && atoi(getenv("WAVE"));
   if (wave) {
@@ -167,6 +229,7 @@ int main(int argc, char** argv) {
     unsigned long long* h_done;
     CK(cudaHostAlloc(&h_done, 8, cudaHostAllocMapped));
     *h_done = 0;
+    h_done_ptr = h_done;
     unsigned long long* d_done;
     CK(cudaHostGetDevicePointer((void**)&d_done, h_done, 0));
     int* h_stop;
@@ -176,8 +239,10 @@ int main(int argc, char** argv) {
     CK(cudaHostGetDevicePointer((void**)&d_stop, h_stop, 0));
     double limit = getenv("TIME_LIMIT") ? atof(getenv("TIME_LIMIT")) : 1e9;
     CK(cudaMemset(d_out, 0xff, n * 20 * sizeof(int)));  // -1 = not solved (time limit)
+    int cheap_loop = getenv("CHEAP_LOOP") && atoi(getenv("CHEAP_LOOP"));
+    printf("cheap stages %s\n", cheap_loop ? "run back to back" : "one step per round");
     wave_kernel<<<grid, block>>>(d_hands, jobs, d_tt, tt_log2, d_out, d_nodes, d_next, d_done,
-                                 d_stop);
+                                 d_stop, cheap_loop);
     auto p0 = std::chrono::steady_clock::now();
     double next_print = 10;
     while (cudaStreamQuery(0) == cudaErrorNotReady) {
@@ -198,8 +263,34 @@ int main(int argc, char** argv) {
   }
   CK(cudaGetLastError());
   CK(cudaDeviceSynchronize());
+  if (wave) {
+    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("finished jobs: %llu in %.1f s = %.1f full-job deals/s\n", *h_done_ptr, el,
+           *h_done_ptr / 5.0 / el);
+  }
   double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+#ifdef DD_PROFILE
+  if (wave) {
+    unsigned long long pr[32];
+    CK(cudaMemcpyFromSymbol(pr, g_prof, sizeof(pr)));
+    const char* names[DD_S_COUNT] = {"JOB", "ROOT", "ENTER", "NEXT", "RET", "EXIT"};
+    double tot = 0;
+    for (int i = 0; i < DD_S_COUNT; i++) tot += pr[i];
+    printf("stage   cycles%%  warp-steps  active lanes/32\n");
+    for (int i = 0; i < DD_S_COUNT; i++)
+      if (pr[8 + i])
+        printf("%-6s  %6.1f  %10llu  %5.1f\n", names[i], 100.0 * pr[i] / tot, pr[8 + i],
+               (double)pr[16 + i] / pr[8 + i]);
+    const char* ex[7] = {"trivial", "last trick", "TT hit", "quick tricks", "later tricks",
+                         "2nd-hand QT", "full (moves)"};
+    double et = 0;
+    for (int i = 0; i < 7; i++) et += pr[24 + i];
+    printf("ENTER exits:");
+    for (int i = 0; i < 7; i++) printf("  %s %.1f%%", ex[i], 100.0 * pr[24 + i] / et);
+    printf("\n");
+  }
+#endif
   std::vector<int> got(n * 20);
   unsigned long long nodes;
   CK(cudaMemcpy(got.data(), d_out, got.size() * sizeof(int), cudaMemcpyDeviceToHost));

@@ -81,6 +81,7 @@ struct DDCtx {
 #ifdef DD_VERIFY
   int no_tt;
 #endif
+  int enter_exit;  // where the last dd_enter returned (profiling)
 };
 
 // One suit's remaining cards, high to low, as 2-bit owners behind a leading 1 bit.
@@ -403,6 +404,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
   f.ub = 0;
   if (c.nplayed == 0) {
     *rel = 0;
+    c.enter_exit = 0;
     if (c.ns_won >= target) return 1;
     if (c.ns_won + c.left < target) return 0;
     need = target - c.ns_won;
@@ -417,6 +419,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
       if (dd_popc(in) >= 2) *rel = 1ull << top;
       int w = 0;
       while (!(c.hand[w] & (1ull << top))) w++;
+      c.enter_exit = 1;
       return (w & 1) == 0 ? 1 : 0;
     }
     dd_node_init(c, nd);
@@ -439,6 +442,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
 #else
     int hit = -1;
 #endif
+    c.enter_exit = 2;
     if (hit >= 0) return hit;
     f.ub = (int8_t)c.left;
     dd_top_init(t, c.hand);
@@ -456,6 +460,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
       c.st_qt++;
       dd_tt_store(c, nd, wr, val ? need : 0, val ? c.left : need - 1, -1);
       *rel = wr;
+      c.enter_exit = 3;
       return val ? 1 : 0;
     }
     wr = 0;
@@ -469,6 +474,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
       bool val = !ns_lead;
       dd_tt_store(c, nd, wr, val ? need : 0, val ? c.left : need - 1, -1);
       *rel = wr;
+      c.enter_exit = 4;
       return val ? 1 : 0;
     }
   }
@@ -483,6 +489,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
     uint64_t wr;
     if (dd_quick_tricks_2nd(c.hand, t, c.trump, second, c.trick[0], cutoff, wr)) {
       *rel = wr;
+      c.enter_exit = 5;
       return (second & 1) == 0 ? 1 : 0;
     }
   }
@@ -500,6 +507,7 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
   f.best = -1;
   f.acc = 0;
   f.tried = 0;
+  c.enter_exit = 6;
   return -1;
 }
 

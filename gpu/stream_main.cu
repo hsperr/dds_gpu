@@ -9,7 +9,7 @@
 //   ./dd_stream bench SECONDS [TT_LOG2] [CHECK_EVERY]
 //                                   random deals; prints deals/s every 10 s and re-solves
 //                                   every CHECK_EVERY-th deal on the CPU to check it
-// Env: THREADS (default 16384), STACK_KB (default 8).
+// Env: THREADS (default 32768), STACK_KB (default 8), PER_LEAD=1 (one job per lead).
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,9 +120,9 @@ static void random_deal(std::mt19937_64& rng, uint64_t* h) {
 int main(int argc, char** argv) {
   bool bench = argc > 1 && !strcmp(argv[1], "bench");
   double seconds = bench && argc > 2 ? atof(argv[2]) : 0;
-  int tt_log2 = bench && argc > 3 ? atoi(argv[3]) : 10;
+  int tt_log2 = bench && argc > 3 ? atoi(argv[3]) : 9;
   long check_every = bench && argc > 4 ? atol(argv[4]) : 50;
-  long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 16384;
+  long threads = getenv("THREADS") ? atol(getenv("THREADS")) : 32768;
   threads = (threads + 63) / 64 * 64;
   size_t stack_kb = getenv("STACK_KB") ? atol(getenv("STACK_KB")) : 8;
   const long ring = 1 << 16;          // deal slots

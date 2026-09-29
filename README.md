@@ -93,14 +93,18 @@ GPU batch:
 Environment:
 
 - `WAVE=1` selects the wavefront kernel (the fast one). Without it the plain kernel runs.
-- `THREADS` number of GPU threads (default 16384). Each thread has its own TT of
-  `2^TT_LOG2` buckets (576 bytes each, so TT_LOG2=10 is 576 KB per thread).
+- `THREADS` number of GPU threads (default 32768). Each thread has its own TT of
+  `2^TT_LOG2` buckets (576 bytes each, so the default TT_LOG2=9 is 288 KB per thread).
 - `STACK_KB` per-thread stack limit (default 8). CUDA reserves this for every resident
   thread, so keep it small; the iterative search needs about 4 KB.
 - `TIME_LIMIT` seconds (wavefront kernel only). After the limit, threads stop cleanly and
-  only finished answers are checked.
+  only finished answers are checked. The last line reports finished jobs / elapsed time.
+- `CHEAP_LOOP=1` (wavefront only) runs the cheap stages back to back until each thread
+  reaches ENTER, instead of one stage per round. Measured: no difference.
+- Build with `-DDD_PROFILE` to print, per stage, the share of warp cycles, warp steps and
+  active lanes out of 32, and where ENTER returned (TT hit, quick tricks, full move list...).
 
-Example: `WAVE=1 THREADS=16384 ./dd_gpu data/deals_20k.npy 0 6553 10`
+Example: `WAVE=1 TIME_LIMIT=180 ./dd_gpu data/deals_20k.npy 0 20000`
 
 `gpu/gpu_run.sh "ssh -p PORT root@HOST"` copies the sources and data to a remote CUDA box,
 builds with the box's compute capability, and runs the ending and full-deal checks.
@@ -117,7 +121,7 @@ GPU streaming:
   input index (0-based) + 20 bytes `tricks[strain C,D,H,S,NT][declarer N,E,S,W]`.
 - `bench` streams random full deals for SECONDS, prints deals/s every 10 s, and re-solves
   every CHECK_EVERY-th deal (default 50) on CPU threads to check it.
-- Env: `THREADS` (default 16384), `STACK_KB` (default 8), `PER_LEAD=1` (20 jobs per deal,
+- `TT_LOG2` default 9. Env: `THREADS` (default 32768), `STACK_KB` (default 8), `PER_LEAD=1` (20 jobs per deal,
   one per lead, instead of 5 per-strain jobs where the 4 leads share the TT).
 - With `-DDD_SHARED_TT`, TT_LOG2 is the total bucket count of the one shared TT
   (e.g. 24 = 9.7 GB).
@@ -217,6 +221,35 @@ The streaming rate drifts down over the first minutes because hard deals gradual
 more threads; ~21-25 deals/s is the long-run figure, about 2.5-3x the 32-core CPU (8.7
 deals/s).
 
+Tuning, batch mode, full deals, 3 minutes each (`TIME_LIMIT=180`, finished jobs / time;
+a 3-minute window still contains the easy start, so these are higher than long-run rates):
+
+| Threads | TT per thread | Full deals/s | Check vs Pgx tables |
+|---|---|---|---|
+| 4,096 | 2.3 MB (TT_LOG2=12) | 18.5 | 0 wrong of 69,859 |
+| 8,192 | 1.2 MB (11) | 30.9 | 0 wrong of 118,684 |
+| 16,384 | 576 KB (10) | 44.2 | 0 wrong of 174,696 |
+| **32,768 (new default)** | 288 KB (9) | **46.8** | 0 wrong of 195,767 |
+
+More threads in flight beat a bigger TT per thread: the kernel waits on memory, and more
+warps hide more of that latency. With the new defaults, 8-card endings run at 12,454 deals/s
+(0 wrong of 6,000 checked against the CPU).
+
+Profile of the wavefront kernel on full deals (`-DDD_PROFILE`; Nsight Compute could not be
+used because the vast.ai container blocks GPU performance counters, `ERR_NVGPUCTRPERM`):
+
+| Stage | Share of warp cycles | Active lanes of 32 |
+|---|---|---|
+| ENTER (bounds, TT probe, move list) | 65% | 32.0 |
+| NEXT (play next move) | 15% | 10.0 |
+| RET (undo, cut test, TT store) | 20% | 3.8 |
+
+ENTER exits: full move list 73%, TT hit 22%, quick tricks 1.3%, trivial 1.7%, others < 1.5%.
+The wavefront works (ENTER always runs with all 32 lanes). The cheap stages run with few
+lanes, but running them back to back (`CHEAP_LOOP=1`) gave the same speed (44.2 vs 43.7
+deals/s), so their cost is memory latency (frames in local memory, TT stores), not
+scheduling. Per-thread search state is ~3.4 KB, ~110 MB at 32,768 threads, more than L2.
+
 Single-thread CPU vs DDS (endplay's libdds, SolveBoard per leader): this solver needs
 about 2-2.5x more cycles than DDS on full deals.
 
@@ -238,8 +271,11 @@ Other findings:
 - **TT sharing.** Solving each lead as its own job (no TT shared between the four leads)
   costs 1.8x. A shared lock-free TT across threads works (`-DDD_SHARED_TT`) but is slower
   on the GPU (see Results).
-- Ideas: splitting ENTER into sub-stages to cut divergence further; hardest-first
-  scheduling.
+- **Memory-bound.** The kernel mostly waits on memory (see the profile). The next real gain
+  would come from less memory traffic per node: a smaller per-thread search state (fewer
+  and smaller frames, keeping the hot parts in registers) or a cheaper TT layout.
+- Ideas: splitting ENTER into sub-stages (only ~27% of ENTER calls leave early, so the gain
+  is limited); hardest-first scheduling.
 - CUDA reserves `cudaLimitStackSize` for all resident threads, so a large `STACK_KB`
   wastes memory. The iterative search needs about 4 KB.
 
