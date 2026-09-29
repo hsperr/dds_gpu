@@ -18,10 +18,12 @@ struct DDWave {
   DDCtx c;
   DDFrame fs[53];
   DDNode nds[14];
-  const uint64_t* hands;  // all deals, 4 masks each
-  int* out;               // 20 results per deal
-  long jobs, job;
-  int stage, sp, strain, decl, lo, hi, target;
+  const uint64_t* hands;  // deals, 4 masks each, by slot
+  int* out;               // 20 results per deal, same slots
+  const unsigned* work;   // if set: slot of the i-th queued deal is work[i % work_ring]
+  long jobs, job, ring, work_ring, slot;  // else deal i sits in slot i % ring
+  int jpd;  // jobs per deal: 5 = one per strain (4 leads share the TT), 20 = one per lead
+  int stage, sp, strain, decl, last_decl, lo, hi, target;
   bool v;
   uint64_t r;
 };
@@ -52,9 +54,9 @@ DD_FN void dd_wave_node_done(DDWave& w) {
     return;
   }
   int ns = w.lo;
-  w.out[w.job / 5 * 20 + w.strain * 4 + w.decl] = (w.decl & 1) == 0 ? ns : 13 - ns;
+  w.out[w.slot * 20 + w.strain * 4 + w.decl] = (w.decl & 1) == 0 ? ns : 13 - ns;
   w.decl++;
-  if (w.decl < 4) {
+  if (w.decl <= w.last_decl) {
     w.stage = DD_S_ROOT;
     w.target = ns < 1 ? 1 : ns;  // start the next lead's binary search at this answer
     return;
@@ -73,11 +75,15 @@ DD_FN void dd_wave_step(DDWave& w, NextJob next_job) {
         w.stage = DD_S_EXIT;
         return;
       }
-      for (int i = 0; i < 4; i++) c.hand[i] = w.hands[w.job / 5 * 4 + i];
-      w.strain = (int)(w.job % 5);
+      long deal = w.job / w.jpd;
+      int sub = (int)(w.job % w.jpd);
+      w.slot = w.work ? (long)w.work[deal % w.work_ring] : deal % w.ring;
+      for (int i = 0; i < 4; i++) c.hand[i] = w.hands[w.slot * 4 + i];
+      w.strain = w.jpd == 5 ? sub : sub / 4;
+      w.decl = w.jpd == 5 ? 0 : sub % 4;
+      w.last_decl = w.jpd == 5 ? 3 : w.decl;
       c.trump = dd_strain_suit(w.strain);
       dd_next_gen(c);
-      w.decl = 0;
       w.target = 7;
       w.stage = DD_S_ROOT;
       return;

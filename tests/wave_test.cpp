@@ -33,6 +33,10 @@ int main(int argc, char** argv) {
   w.hands = hands.data();
   w.out = got.data();
   w.jobs = n * 5;
+  w.ring = n;
+  w.work = 0;
+  w.jpd = getenv("JPD") ? atoi(getenv("JPD")) : 5;
+  w.jobs = n * w.jpd;
   w.stage = DD_S_JOB;
   long next = 0;
   long steps[DD_S_COUNT] = {0};

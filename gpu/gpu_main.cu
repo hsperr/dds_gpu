@@ -62,6 +62,9 @@ __global__ void wave_kernel(const uint64_t* hands, long jobs, DDBucket* tt, int 
     for (int k = 0; k < DD_TT_WAYS; k++) w.c.tt[i].tag[k] = 0;
   w.hands = hands;
   w.out = out;
+  w.ring = jobs / 5;
+  w.work = 0;
+  w.jpd = 5;
   w.jobs = jobs;
   w.stage = DD_S_JOB;
   auto take = [&] { return (long)atomicAdd(next, 1ull); };
@@ -176,9 +179,12 @@ int main(int argc, char** argv) {
     wave_kernel<<<grid, block>>>(d_hands, jobs, d_tt, tt_log2, d_out, d_nodes, d_next, d_done,
                                  d_stop);
     auto p0 = std::chrono::steady_clock::now();
+    double next_print = 10;
     while (cudaStreamQuery(0) == cudaErrorNotReady) {
-      std::this_thread::sleep_for(std::chrono::seconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - p0).count();
+      if (el < next_print) continue;
+      next_print += 10;
       unsigned long long fin = *(volatile unsigned long long*)h_done;
       printf("  %.0fs: %llu of %ld jobs done (%.1f deals/s)\n", el, fin, jobs, fin / 5.0 / el);
       if (el > limit && !*h_stop) {

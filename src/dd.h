@@ -140,6 +140,16 @@ DD_FN bool dd_pattern_match(uint64_t p, uint64_t code) {
   return (code >> (2 * (len - n))) == p;
 }
 
+// What separates TT entries of different solves. An entry describes a class of positions
+// (owners of the relevant cards, all suit lengths, leader), valid for any deal with the
+// same trump suit. DD_SHARED_TT keys on the trump suit only, so one TT can serve every
+// deal; otherwise each solve gets its own generation.
+#ifdef DD_SHARED_TT
+#define DD_KEY(c) ((uint32_t)((c).trump + 2))
+#else
+#define DD_KEY(c) ((c).gen)
+#endif
+
 struct DDNode {  // trick-start data kept for the TT store
   uint64_t code[4], lens, all;
   DDBucket* bucket;
@@ -152,12 +162,86 @@ DD_FN void dd_node_init(const DDCtx& c, DDNode& nd) {
   nd.all = c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3];
   uint64_t h = dd_hash(nd.lens, c.leader);
   nd.bucket = c.tt + (h & c.tt_mask);
-  nd.tag = ((uint32_t)(h >> 32) & 0xFFFFFF00u) | (c.gen << 2) | (uint32_t)c.leader;
+  nd.tag = ((uint32_t)(h >> 32) & 0xFFFFFF00u) | (DD_KEY(c) << 2) | (uint32_t)c.leader;
 }
 
+#ifdef DD_SHARED_TT
+// Shared TT (many threads, no locks). Entries are written word by word, so a reader may
+// see a half-written one; the checksum in meta's top 32 bits makes it miss instead. New
+// entries overwrite one way in place (no shifting, which would race).
+DD_FN uint64_t dd_entry_check(uint64_t pat0, uint64_t pat1, uint64_t lens, uint64_t meta) {
+  uint64_t h = (pat0 * 0x9E3779B97F4A7C15ull) ^ (pat1 + 0x632BE59BD9B4E019ull) ^
+               (lens * 0xC2B2AE3D27D4EB4Full) ^ ((meta & 0xFFFFFFFFull) * 0x165667B19E3779F9ull);
+  h ^= h >> 31;
+  h *= 0xBF58476D1CE4E5B9ull;
+  return (h >> 32) << 32;
+}
+
+DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel, int* best) {
+  uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
+  for (int i = 0; i < DD_TT_WAYS; i++) {
+    if (((volatile uint32_t*)nd.bucket->tag)[i] != nd.tag) continue;
+    volatile const DDEntry& v = nd.bucket->e[i];
+    uint64_t pat0 = v.pat0, pat1 = v.pat1, lens = v.lens, meta = v.meta;
+    if ((meta & 0xFF) != tag || lens != nd.lens) continue;
+    if ((meta & ~0xFFFFFFFFull) != dd_entry_check(pat0, pat1, lens, meta)) continue;
+    uint64_t p[4] = {pat0 & 0x7FFFFFF, pat0 >> 27, pat1 & 0x7FFFFFF, pat1 >> 27};
+    bool match = true;
+    for (int s = 0; s < 4 && match; s++) match = dd_pattern_match(p[s], nd.code[s]);
+    if (!match) continue;
+    int lb = (int)(meta >> 8) & 15, ub = (int)(meta >> 12) & 15;
+    if (lb >= need || ub < need) {
+      uint64_t r = 0;
+      for (int s = 0; s < 4; s++) r |= dd_top_cards(nd.all, s, dd_pattern_len(p[s]));
+      *rel = r;
+      return lb >= need;
+    }
+    int b = (int)(meta >> 16) & 127;
+    if (b) *best = b - 1;
+  }
+  return -1;
+}
+
+DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub, int best) {
+  uint64_t pat0 = dd_pattern(nd.code[0], nd.all, rel, 0) |
+                  (dd_pattern(nd.code[1], nd.all, rel, 1) << 27);
+  uint64_t pat1 = dd_pattern(nd.code[2], nd.all, rel, 2) |
+                  (dd_pattern(nd.code[3], nd.all, rel, 3) << 27);
+  uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
+  DDBucket* b = nd.bucket;
+  volatile uint32_t* tags = (volatile uint32_t*)b->tag;
+  int victim = -1;
+  for (int i = 0; i < DD_TT_WAYS; i++) {
+    uint32_t t = tags[i];
+    if (t == 0 && victim < 0) victim = i;
+    if (t != nd.tag) continue;
+    volatile DDEntry& v = b->e[i];
+    uint64_t m = v.meta;
+    if ((m & 0xFF) == tag && v.lens == nd.lens && v.pat0 == pat0 && v.pat1 == pat1 &&
+        (m & ~0xFFFFFFFFull) == dd_entry_check(pat0, pat1, nd.lens, m)) {
+      int olb = (int)(m >> 8) & 15, oub = (int)(m >> 12) & 15;
+      if (olb > lb) lb = olb;
+      if (oub < ub) ub = oub;
+      if (best < 0) best = (int)((m >> 16) & 127) - 1;
+      uint64_t meta = tag | ((uint64_t)lb << 8) | ((uint64_t)ub << 12) | ((uint64_t)(best + 1) << 16);
+      v.meta = meta | dd_entry_check(pat0, pat1, nd.lens, meta);
+      return;
+    }
+  }
+  if (victim < 0) victim = (int)((c.nodes ^ (c.nodes >> 7)) & (DD_TT_WAYS - 1));
+  uint64_t meta = tag | ((uint64_t)lb << 8) | ((uint64_t)ub << 12) | ((uint64_t)(best + 1) << 16);
+  volatile DDEntry& v = b->e[victim];
+  tags[victim] = 0;
+  v.pat0 = pat0;
+  v.pat1 = pat1;
+  v.lens = nd.lens;
+  v.meta = meta | dd_entry_check(pat0, pat1, nd.lens, meta);
+  tags[victim] = nd.tag;
+}
+#else
 // Looks up bounds of NS tricks still to win. Returns 1 true, 0 false, -1 unknown.
 DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel, int* best) {
-  uint64_t tag = ((uint64_t)c.gen) | ((uint64_t)c.leader << DD_GEN_BITS);
+  uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
   for (int i = 0; i < DD_TT_WAYS; i++) {
     if (nd.bucket->tag[i] != nd.tag) continue;
     const DDEntry& e = nd.bucket->e[i];
@@ -193,7 +277,7 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
                   (dd_pattern(nd.code[1], nd.all, rel, 1) << 27);
   uint64_t pat1 = dd_pattern(nd.code[2], nd.all, rel, 2) |
                   (dd_pattern(nd.code[3], nd.all, rel, 3) << 27);
-  uint64_t tag = ((uint64_t)c.gen) | ((uint64_t)c.leader << DD_GEN_BITS);
+  uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
   DDBucket* b = nd.bucket;
   for (int i = 0; i < DD_TT_WAYS; i++) {
     if (b->tag[i] != nd.tag) continue;
@@ -226,6 +310,8 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
   b->e[0].dbg_rel = rel; b->e[0].dbg_leader = c.leader; b->e[0].dbg_lb = lb; b->e[0].dbg_ub = ub;
 #endif
 }
+
+#endif
 
 DD_FN bool dd_beats(int card, int best, int trump) {
   int s = card >> 4, bs = best >> 4;
@@ -543,6 +629,9 @@ node_done:  // fs[sp] is done with (v, r)
 }
 
 DD_FN void dd_next_gen(DDCtx& c) {
+#ifdef DD_SHARED_TT
+  return;  // entries stay valid across deals
+#endif
   c.gen++;
   if (c.gen >= (1u << DD_GEN_BITS)) {
     for (uint32_t i = 0; i <= c.tt_mask; i++)

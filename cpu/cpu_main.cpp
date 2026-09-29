@@ -30,12 +30,21 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> nodes{0};
   auto t0 = std::chrono::steady_clock::now();
   std::vector<std::thread> pool;
+#ifdef DD_SHARED_TT
+  // One TT for all threads (lock-free entries), sized like all per-thread TTs together.
+  std::vector<DDBucket> shared_tt((size_t)threads << tt_log2);
+#endif
   for (int t = 0; t < threads; t++) {
     pool.emplace_back([&] {
-      std::vector<DDBucket> tt((size_t)1 << tt_log2);
       DDCtx c{};
+#ifdef DD_SHARED_TT
+      c.tt = shared_tt.data();
+      c.tt_mask = (uint32_t)(shared_tt.size() - 1);
+#else
+      std::vector<DDBucket> tt((size_t)1 << tt_log2);
       c.tt = tt.data();
       c.tt_mask = (1u << tt_log2) - 1;
+#endif
       uint64_t hands[4];
       for (long job; (job = next++) < count * 5;) {
         long i = job / 5;
