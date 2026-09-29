@@ -154,15 +154,13 @@ DD_FN uint64_t dd_hash(uint64_t lens, int leader) {
   return h ^ (h >> 32);
 }
 
-// Top `n` remaining cards of each suit, as a card mask; n from a stored pattern.
+// Top `n` remaining cards of suit s, as a card mask; n from a stored pattern. Binary
+// search for the lowest rank r with n cards at or above it (r = 15, no card, for n = 0).
 DD_FN uint64_t dd_top_cards(uint64_t all, int s, int n) {
-  uint64_t out = 0, a = all & DD_SUIT(s);
-  for (int i = 0; i < n; i++) {
-    uint64_t bit = 1ull << dd_msb(a);
-    out |= bit;
-    a ^= bit;
-  }
-  return out;
+  uint64_t a = (all >> (16 * s)) & 0x1FFF;
+  int r = 0;
+  for (int k = 8; k; k >>= 1) r += dd_popc(a >> (r + k)) >= n ? k : 0;
+  return (a >> r << r) << (16 * s);
 }
 
 // Owner pattern of the relevant top cards of suit s (all cards >= lowest rel card).
@@ -229,7 +227,7 @@ DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel,
     if ((meta & ~0xFFFFFFFFull) != dd_entry_check(pat0, pat1, lens, meta)) continue;
     uint64_t p[4] = {pat0 & 0x7FFFFFF, pat0 >> 27, pat1 & 0x7FFFFFF, pat1 >> 27};
     bool match = true;
-    for (int s = 0; s < 4 && match; s++) match = dd_pattern_match(p[s], nd.code[s]);
+    for (int s = 0; s < 4; s++) match &= dd_pattern_match(p[s], nd.code[s]);
     if (!match) continue;
     int lb = (int)(meta >> 8) & 15, ub = (int)(meta >> 12) & 15;
     if (lb >= need || ub < need) {
@@ -284,14 +282,15 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
 // Looks up bounds of NS tricks still to win. Returns 1 true, 0 false, -1 unknown.
 DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel, int* best) {
   uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
-  for (int i = 0; i < DD_TT_WAYS; i++) {
-    uint32_t t = nd.bucket->tag[i];
-    if ((t & ~0xF00u) != nd.tag) continue;
-    const DDEntry& e = nd.bucket->e[(t >> 8) & 15];
+  uint32_t ways = 0;  // ways whose tag matches, found with a fixed loop
+  for (int i = 0; i < DD_TT_WAYS; i++)
+    ways |= (uint32_t)((nd.bucket->tag[i] & ~0xF00u) == nd.tag) << i;
+  for (; ways; ways &= ways - 1) {
+    const DDEntry& e = nd.bucket->e[(nd.bucket->tag[dd_lsb(ways)] >> 8) & 15];
     if ((e.meta & 0xFF) != tag || e.lens != nd.lens) continue;
     uint64_t p[4] = {e.pat0 & 0x7FFFFFF, e.pat0 >> 27, e.pat1 & 0x7FFFFFF, e.pat1 >> 27};
     bool match = true;
-    for (int s = 0; s < 4 && match; s++) match = dd_pattern_match(p[s], nd.code[s]);
+    for (int s = 0; s < 4; s++) match &= dd_pattern_match(p[s], nd.code[s]);
     if (!match) continue;
     int lb = (int)(e.meta >> 8) & 15, ub = (int)(e.meta >> 12) & 15;
     if (lb >= need || ub < need) {
