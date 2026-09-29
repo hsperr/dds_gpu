@@ -3,76 +3,64 @@
 An exact double-dummy solver for bridge whose search runs on the GPU (CUDA). The same
 header-only core also builds for the CPU, which is how it is tested.
 
-## What it is
+## How it works
 
 - **One solve per GPU thread.** A job is one (deal, strain). The thread solves the four
   leads of that strain one after another, sharing one transposition table (TT), and writes
   the four trick counts. Threads take the next job from a global atomic counter.
-- **Null-window boolean search.** The search answers "can NS take >= N tricks?", not a
-  minimax over trick counts. The trick count comes from a binary search over N (starting
-  from the previous lead's answer), all searches reusing the same TT.
+- **Null-window boolean search.** The search answers "can NS take >= N tricks?". The trick
+  count comes from a binary search over N (starting from the previous lead's answer), all
+  searches reusing the same TT.
 - **Partition-search TT** (the DDS idea). Every search returns the set of cards whose rank
-  decided the result. A TT entry stores the owner pattern of the relevant top cards of each
-  suit (relative ranks, not absolute) plus the exact suit lengths of every hand, so one entry
-  covers many positions. Small cards below the lowest relevant card of a suit are treated
-  as equal, so only one of them is tried. Buckets are 16-way with 32-bit tags stored first,
-  so a probe normally touches one 64-byte line. Tags are kept newest first and each tag
-  names the way of its entry, so a store shifts only the tag line, not the whole bucket
-  (+9% full deals/s, +22% on 8-card endings on an RTX 4070 Ti SUPER; same node counts).
-- **16-byte entries (default, exact).** An entry keeps 39 bits of the suit-length hash
-  instead of the lengths (the hash is a bijection, so bucket + tag + those bits identify the
-  lengths exactly), no generation or leader (the tag has them), and the owner patterns as
-  counts plus concatenated owner bits (up to 29 relevant cards; a store with more is
-  skipped). A bucket is 320 bytes.
-- **12-byte entries (`-DDD_TT_SIG`, not strictly exact).** An entry keeps a 64-bit hash of
-  its key (owner patterns, suit lengths, tag) plus the relevant-card counts, so there is no
-  card limit. A wrong hit needs two keys with the same tag and the same 64-bit hash. A
-  bucket is 256 bytes. Fewer nodes and faster than the default (see Results).
-- **Eviction by depth.** Each tag also holds the tricks left of its entry. A new entry in a
-  full bucket replaces the tag with the least 2 x tricks left + age rank (old generations
-  first), so entries that saved deep searches stay longer. The choice reads only the tag
-  line. At 2^9 buckets this alone cuts nodes from 80M to 35M per deal (CPU, 8 deals).
-- The shared-TT build (`-DDD_SHARED_TT`) keeps the 32-byte entry (576-byte buckets) and
-  in-place replacement.
+  decided the result. A TT entry stores the owners of the relevant top cards of each suit
+  (relative ranks) plus the suit lengths of every hand, so one entry covers many positions.
+  Small cards below the lowest relevant card of a suit are treated as equal.
+- **Compact TT.** Buckets are 16-way with a 64-byte line of 32-bit tags first, so a probe
+  normally reads one line. Each tag holds hash bits, the way of its entry, the tricks left,
+  the solve generation and the leader.
+  - Default: 16-byte exact entries. The suit lengths are not stored: the hash is a
+    bijection, so bucket + tag + 39 stored hash bits identify them. Up to 29 relevant cards
+    per entry; larger results are not stored.
+  - `-DDD_TT_SIG`: 12-byte entries holding a 64-bit hash of the key instead of the key. No
+    card limit, fewer nodes and faster, but not strictly exact: a wrong hit needs two keys
+    with the same tag and the same 64-bit hash.
+- **Eviction by depth.** A new entry in a full bucket replaces the tag with the least
+  2 x tricks left + age, so entries that saved deep searches stay longer. The choice reads
+  only the tag line; a store rewrites only the tag line and one entry.
 - **DDS bounds and move ordering.** QuickTricks, QuickTricksSecondHand, LaterTricks and the
-  DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`), kept close to the
-  original so the two can be compared.
+  DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`).
+- **Bit operations.** Cards are bits of a `uint64`; card owners, suit patterns, suit
+  lengths, TT matching and equal-card skips are computed with bit operations instead of
+  loops over cards.
 - **Explicit-stack search.** The depth-first search is a loop over an array of small frames
-  instead of recursion, so a GPU thread needs only a few KB of stack. On the GPU the
-  wavefront state (frames, context, ~4 KB) lives in global memory, one contiguous block per
-  thread: in local memory CUDA interleaves it across threads in 4-byte words, so threads at
-  different depths touch many more sectors per frame (+13% full deals/s).
+  instead of recursion. On the GPU each thread's state (~4 KB) lives in one contiguous block
+  of global memory.
 - **Wavefront kernel.** The search is also written as a resumable stage machine
-  (`src/dd_wave.h`). In the wavefront kernel each warp runs one stage at a time for all its
-  threads: the cheap stages first (RET: a child returned; NEXT: play the next move; ROOT
-  and JOB: next binary-search step or next job), then the expensive ENTER stage (bounds,
-  TT probe, move generation). Threads therefore gather at ENTER and run it together
-  instead of diverging through different code paths. This is the fast kernel.
+  (`src/dd_wave.h`). Each warp runs one stage at a time for all its threads: the cheap
+  stages first (RET, NEXT, ROOT, JOB), then the expensive ENTER stage (bounds, TT probe,
+  move generation), so threads gather at ENTER and run it together.
 
-## Two modes
+Two drivers:
 
 - **Batch** (`gpu/gpu_main.cu`, `dd_gpu`): solves a fixed set of deals, for offline data
-  generation. About 30-37 full deals/s over a fixed batch (28-30 steady), but the batch ends
-  with a tail where a few hard jobs keep a few threads busy.
-- **Streaming** (`gpu/stream_main.cu`, `dd_stream`): for continuous use (e.g. a bridge
-  platform). One persistent wavefront kernel keeps running; deals flow through a ring of
-  slots in pinned, mapped host memory. A deal is reported as soon as all its jobs are done,
-  through a finished-slot list, so results come out of input order and one slow deal does
-  not hold up the others. No batch tail.
+  generation. The batch ends with a tail where a few hard jobs keep a few threads busy.
+- **Streaming** (`gpu/stream_main.cu`, `dd_stream`): one persistent kernel keeps running
+  while deals flow through a ring of slots in pinned host memory. A deal is reported as soon
+  as it is solved (out of input order), so one slow deal does not hold up the others.
 
 ## Layout
 
 ```
-src/dd.h          core search: null-window search, partition-search TT, iterative search
-src/dd_bounds.h   DDS-derived QuickTricks / QuickTricksSecondHand / LaterTricks, move weights
-src/dd_wave.h     resumable stage machine used by the wavefront kernel
-src/npy.h         loader for Pgx .npy DDS tables
-gpu/gpu_main.cu   CUDA batch driver (plain kernel and wavefront kernel), checks its answers
+src/dd.h            core search: null-window search, partition-search TT, iterative search
+src/dd_bounds.h     DDS-derived QuickTricks / QuickTricksSecondHand / LaterTricks, move weights
+src/dd_wave.h       resumable stage machine used by the wavefront kernel
+src/npy.h           loader for Pgx .npy DDS tables
+gpu/gpu_main.cu     CUDA batch driver (plain and wavefront kernel), checks its answers
 gpu/stream_main.cu  CUDA streaming driver (persistent wavefront kernel, ring buffer)
-gpu/gpu_run.sh    upload, build and run on a remote CUDA box over ssh
-cpu/cpu_main.cpp  multi-threaded CPU solver, checked against the Pgx tables
-tests/            correctness tests (check.sh runs them), live DDS comparison, debug tools
-bench/            node/time benchmarks, comparison against DDS via endplay
+gpu/gpu_run.sh      upload, build and run on a remote CUDA box over ssh
+cpu/cpu_main.cpp    multi-threaded CPU solver, checked against the Pgx tables
+tests/              correctness tests (check.sh runs them), live DDS comparison, debug tools
+bench/              node/time benchmarks, comparison against DDS via endplay
 data/deals_20k.npy  20,000 deals with DDS tables (Pgx dataset, see below)
 ```
 
@@ -85,22 +73,20 @@ CPU (any C++17 compiler; Apple clang works):
 
 ```
 make                  # build/dd_cpu plus test and bench tools
+```
+
+GPU (`SM` = compute capability, e.g. 89 for Ada, 120 for Blackwell consumer):
+
+```
+make gpu SM=89                          # build/dd_gpu and build/dd_stream, exact TT
+make gpu SM=89 NVFLAGS=-DDD_TT_SIG      # 12-byte hash TT entries
 # or by hand:
-c++ -O3 -std=c++17 -march=native -pthread -Isrc -o dd_cpu cpu/cpu_main.cpp
+nvcc -O3 -std=c++17 -arch=sm_89 -Isrc -o dd_gpu gpu/gpu_main.cu
 ```
 
-GPU (`sm_XX` = your GPU's compute capability, e.g. 89 for Ada, 120 for Blackwell consumer):
-
-```
-make gpu SM=120       # build/dd_gpu and build/dd_stream
-# or by hand:
-nvcc -O3 -std=c++17 -arch=sm_120 -Isrc -o dd_gpu gpu/gpu_main.cu
-nvcc -O3 -std=c++17 -arch=sm_120 -Isrc -o dd_stream gpu/stream_main.cu
-```
-
-Add `-DDD_TT_SIG` for the 12-byte hash entries (faster, not strictly exact; e.g.
-`make gpu SM=89 NVFLAGS=-DDD_TT_SIG`), or `-DDD_SHARED_TT` for the shared-TT experiment (see
-below). The default build uses one exact TT per thread.
+Other build flags: `-DDD_SHARED_TT` (one lock-free TT shared by all threads, keyed by trump
+suit; slower on the GPU), `-DDD_PROFILE` (per-stage cycle and active-lane counters in the
+wavefront kernel).
 
 ## Run
 
@@ -109,26 +95,14 @@ GPU batch:
 ```
 ./dd_gpu K DEALS [TT_LOG2] [CHECK]         # random K-card endings; first CHECK deals re-solved on the CPU
 ./dd_gpu FILE.npy START DEALS [TT_LOG2]    # full deals from a Pgx file, checked against its tables
+WAVE=1 TIME_LIMIT=120 ./dd_gpu data/deals_20k.npy 0 20000
 ```
 
-Environment:
-
-- `WAVE=1` selects the wavefront kernel (the fast one). Without it the plain kernel runs.
-- `THREADS` number of GPU threads (default 32768). Each thread has its own TT of
-  `2^TT_LOG2` buckets (320 bytes each, so the default TT_LOG2=10 is 320 KB per thread; TT_LOG2 >= 9).
-- `STACK_KB` per-thread stack limit (default 8). CUDA reserves this for every resident
-  thread, so keep it small; the iterative search needs about 4 KB.
-- `TIME_LIMIT` seconds (wavefront kernel only). After the limit, threads stop cleanly and
-  only finished answers are checked. The last line reports finished jobs / elapsed time.
-- `CHEAP_LOOP=1` (wavefront only) runs the cheap stages back to back until each thread
-  reaches ENTER, instead of one stage per round. Measured: no difference.
-- Build with `-DDD_PROFILE` to print, per stage, the share of warp cycles, warp steps and
-  active lanes out of 32, and where ENTER returned (TT hit, quick tricks, full move list...).
-
-Example: `WAVE=1 TIME_LIMIT=180 ./dd_gpu data/deals_20k.npy 0 20000`
-
-`gpu/gpu_run.sh "ssh -p PORT root@HOST"` copies the sources and data to a remote CUDA box,
-builds with the box's compute capability, and runs the ending and full-deal checks.
+- `WAVE=1` selects the wavefront kernel (the fast one).
+- `THREADS` GPU threads (default 32768). Each has its own TT of `2^TT_LOG2` buckets
+  (default 10, minimum 9; 320 KB per thread with exact entries, 256 KB with `-DDD_TT_SIG`).
+- `TIME_LIMIT` seconds (wavefront only): stop cleanly and check only finished answers.
+- `STACK_KB` per-thread stack limit (default 8).
 
 GPU streaming:
 
@@ -138,14 +112,14 @@ GPU streaming:
 ```
 
 - Input: 32 bytes per deal, 4 x `uint64` hand masks (N,E,S,W), card encoding as above.
-- Output: 28 bytes per deal, written when the deal is solved (not in input order): `uint64`
-  input index (0-based) + 20 bytes `tricks[strain C,D,H,S,NT][declarer N,E,S,W]`.
-- `bench` streams random full deals for SECONDS, prints deals/s every 10 s, and re-solves
-  every CHECK_EVERY-th deal (default 50) on CPU threads to check it.
-- `TT_LOG2` default 10 (minimum 9). Env: `THREADS` (default 32768), `STACK_KB` (default 8), `PER_LEAD=1` (20 jobs per deal,
-  one per lead, instead of 5 per-strain jobs where the 4 leads share the TT).
-- With `-DDD_SHARED_TT`, TT_LOG2 is the total bucket count of the one shared TT
-  (e.g. 24 = 9.7 GB).
+- Output: 28 bytes per deal, written when the deal is solved: `uint64` input index
+  (0-based) + 20 bytes `tricks[strain C,D,H,S,NT][declarer N,E,S,W]`.
+- `bench` streams random full deals, prints deals/s every 10 s and re-solves every
+  CHECK_EVERY-th deal (default 50) on the CPU to check it.
+- Env: `THREADS`, `STACK_KB`, `PER_LEAD=1` (one job per lead instead of per strain).
+
+Remote box: `gpu/gpu_run.sh "ssh -p PORT root@HOST"` uploads the sources and data, builds
+for the box's GPU and runs the ending and full-deal checks.
 
 CPU:
 
@@ -154,186 +128,72 @@ CPU:
 ./build/dd_cpu data/deals_20k.npy 0 100 8 12
 ```
 
-`GUESS=exact|off1` starts each lead's search from the stored answer (or one off), an
-experiment on how much a good first guess saves.
-
-**Shared TT (`-DDD_SHARED_TT`, experiment).** The TT key is the trump suit instead of a
-per-solve generation, so an entry describes a position class valid for any deal with that
-trump suit and one TT can serve every deal and thread. Entries are lock-free: a checksum in
-the top 32 bits of `meta` turns a half-written entry into a miss, and new entries replace
-one way in place. Built with it, `dd_cpu` makes all threads share one TT.
-
 ## Tests
 
 ```
 tests/check.sh              # or: make check
 DEALS=10 tests/check.sh     # fewer full deals, faster
+CXX="c++ -DDD_TT_SIG" tests/check.sh
 ```
 
-`check.sh` builds and runs:
+`check.sh` runs:
 
-1. `test_small.cpp`: plain minimax (no pruning) vs the solver on random 1..4-card endings,
-   all strains and leads.
-2. `cmp_tt.cpp`: full solver vs plain search (no TT, no bounds, no small-card skip, built
-   with `-DDD_NO_TT -DDD_NO_SMALL -DDD_NO_QT -DDD_NO_LT -DDD_NO_QT2`) on 5..7-card endings.
-3. `wave_test.cpp`: the stage machine must give the same answers and the same node counts
-   as the loop search. `JPD=20 build/wave_test 8 200` tests one job per lead (answers must
-   match; node counts differ because the leads no longer share a TT).
+1. `test_small.cpp`: plain minimax vs the solver on random 1..4-card endings.
+2. `cmp_tt.cpp`: full solver vs plain search (no TT, no bounds, no small-card skip) on
+   5..7-card endings.
+3. `wave_test.cpp`: the stage machine must give the same answers and node counts as the
+   loop search.
 4. `cpu_main.cpp` on DEALS full deals from `data/deals_20k.npy` vs the stored DDS tables.
 
-It exits non-zero on any mismatch and prints `0 wrong of N` lines when everything agrees.
+It exits non-zero on any mismatch.
 
-Debug tools in `tests/`: `brute_one.cpp` (minimax one position given as four hex masks),
-`verify_one.cpp` (build with `-DDD_VERIFY`: re-checks every TT hit with a TT-free search
-and prints bad hits), `one_deal.sh` (solve single deals from the data file with feature
-switches, e.g. `tests/one_deal.sh "-DDD_NO_QT" 5013`), `pbn.cpp` (print a deal as PBN
-with its stored table).
-
-Live comparison against DDS: `python tests/vs_dds.py K DEALS [SEED]` deals fresh random
-K-card endings, solves them with `build/dd_pbn` (reads PBN lines, prints tricks for the side
-on lead per strain and leader; override the path with `DD_PBN=...`) and with DDS through the
-`endplay` package's libdds, all strains and leads, and prints `0 wrong of N` on agreement.
-
-Bench: `bench/bench_k.cpp` (nodes and time per strain solve on random K-card endings;
-`PBN=1` prints the deals instead), `bench/dds_nodes.py` and `bench/dds_nodes_pbn.py`
-(DDS nodes and time for the same deals through the `endplay` Python package).
+Other tools in `tests/`: `brute_one.cpp` (minimax one position), `verify_one.cpp` (build
+with `-DDD_VERIFY`: re-checks every TT hit with a TT-free search), `one_deal.sh` (single
+deals with feature switches), `pbn.cpp` (print a deal as PBN), `vs_dds.py` (live comparison
+against DDS through the `endplay` package). `bench/` measures nodes and time per solve, also
+for DDS.
 
 ## Correctness
 
-- Brute-force minimax on small endings and full vs plain search agree (see Tests).
-- Full deals vs the Pgx DDS tables, CPU: 0 wrong of 10,000 answers on 500 deals.
-- GPU wavefront kernel on full deals vs the Pgx tables: 0 wrong of 244,259 answers.
-- GPU on 8-card endings vs the CPU build of the same code: 0 wrong on 6,000 checks.
-- Live vs DDS (`tests/vs_dds.py`, fresh random deals): 0 wrong of 12,000 answers on 5-, 8-
-  and 10-card endings (200 deals each, all strains and leads).
-- Streaming mode, live CPU re-solve of a sample of the streamed deals: 0 wrong in all runs
-  (396, 345 and 276 full deals checked, see Results).
-- Shared TT (`-DDD_SHARED_TT`): 0 wrong in all tests; 12 CPU threads sharing one TT: 0
-  wrong of 1,920 answers on full deals.
+- Full deals vs the Pgx DDS tables: 0 wrong on every GPU run (latest: 176,672 answers exact
+  TT, 182,060 with `-DDD_TT_SIG`) and on the CPU.
+- Random endings, GPU vs the CPU build: 0 wrong. Live vs DDS on fresh 5-, 8- and 10-card
+  endings: 0 wrong of 12,000 answers.
+- Streaming mode, live CPU re-solve of a sample of the streamed deals: 0 wrong.
 
-One bug found this way and fixed: move generation tries only the top card of a run of
-touching cards of the player to move. When the lowest relevant card of a suit is part of
-such a run, the whole run must stay relevant. Otherwise the TT merges positions where a
-card of another hand sits inside the run and breaks it (`dd_finish` in `src/dd.h`).
+## Performance
 
-## Results
+Full 13-card deals, all 20 results per deal, wavefront kernel, 32,768 threads, 120 s from
+`data/deals_20k.npy` (`TIME_LIMIT=120`), RTX 4070 Ti SUPER 16 GB:
 
-RTX 5070 Ti 16 GB vs a 32-core CPU on the same vast.ai box, same code. The CUDA driver
-compiled and ran there; these are the numbers from those runs.
+| Version | Full deals/s |
+|---|---|
+| First wavefront version (787cc62) | 37.9* |
+| TT store shifts only the tag line | 41.5* |
+| Bit operations instead of loops over cards | 47.8 |
+| 16-byte TT entries | 52.8 |
+| + eviction by depth | 59.9 |
+| + thread state in contiguous global memory (**default**) | **~65** |
+| Same with `-DDD_TT_SIG` | **67.7** |
 
-| Workload | GPU wavefront | GPU plain kernel | CPU 32 threads |
-|---|---|---|---|
-| 8-card endings | 11,075 deals/s | 6,027 deals/s | ~4,000-4,500 deals/s |
-| Full 13-card deals (all 20 results) | ~30-37 deals/s (steady ~28-30, 36.7 avg over 310 s) | not measured cleanly | 8.7 deals/s |
+\* Measured on a second RTX 4070 Ti SUPER box and scaled by 0.80 (the same code ran 59.5
+there and 47.8 on the box used for the other rows).
 
-Full-deal GPU run (batch mode): 16,384 threads, 576 KB TT per thread (TT_LOG2=10), 56,835
-strain-jobs in 310 s.
+Full deals/s over 120 s count finished (deal, strain) jobs / 5 and favour the easier deals;
+over long streaming runs the rate is lower. For reference, the CPU build of an earlier
+version ran 8.7 full deals/s on 32 cores, and on one CPU core this solver needs about
+2-2.5x the cycles of DDS.
 
-Streaming mode, same box: RTX 5070 Ti, 16,384 threads, 5 minutes of random full deals
-(`dd_stream bench`), a sample of the deals re-solved live on the CPU:
+## Known limits
 
-| Setup | Full deals/s | Live CPU check |
-|---|---|---|
-| Per-thread TT 576 KB, per-strain jobs (default) | 25.6 (about 21-22 in the last minutes) | 0 wrong of 396 |
-| Shared TT 9.7 GB, per-strain jobs | 22.3 | 0 wrong of 345 |
-| Shared TT 9.7 GB, per-lead jobs (`PER_LEAD=1`) | 19.1 | 0 wrong of 276 |
-
-The streaming rate drifts down over the first minutes because hard deals gradually occupy
-more threads; ~21-25 deals/s is the long-run figure, about 2.5-3x the 32-core CPU (8.7
-deals/s).
-
-Tuning, batch mode, full deals, 3 minutes each (`TIME_LIMIT=180`, finished jobs / time;
-a 3-minute window still contains the easy start, so these are higher than long-run rates):
-
-| Threads | TT per thread | Full deals/s | Check vs Pgx tables |
-|---|---|---|---|
-| 4,096 | 2.3 MB (TT_LOG2=12) | 18.5 | 0 wrong of 69,859 |
-| 8,192 | 1.2 MB (11) | 30.9 | 0 wrong of 118,684 |
-| 16,384 | 576 KB (10) | 44.2 | 0 wrong of 174,696 |
-| **32,768 (new default)** | 288 KB (9) | **46.8** | 0 wrong of 195,767 |
-
-More threads in flight beat a bigger TT per thread: the kernel waits on memory, and more
-warps hide more of that latency. With the new defaults, 8-card endings run at 12,454 deals/s
-(0 wrong of 6,000 checked against the CPU).
-
-RTX 4070 Ti SUPER, defaults, 120 s of full deals:
-
-| Version | Full deals/s | 8-card endings/s | Check |
-|---|---|---|---|
-| Before | 47.2 | 9,069 | 0 wrong of 136,248 |
-| TT store shifts only the tag line | 51.6 | 10,502 | 0 wrong of 147,694 |
-| + owners, suit codes, TT probe, move skips with bit operations (no loops over cards) | **59.5** | **13,299** | 0 wrong of 168,668 |
-
-Node counts are the same in all three; only the work per node changed.
-
-TT layout and eviction, on a second RTX 4070 Ti SUPER box (slower: the same code runs 47.8
-there vs 59.5 above), 120 s of full deals, 32,768 threads. Nodes: CPU, first 8 deals of
-`data/deals_20k.npy`, same bucket count:
-
-| TT | Per thread | Full deals/s | Nodes/deal | Check |
-|---|---|---|---|---|
-| 32-byte entries, FIFO | 288 KB | 47.8 | 80.2M | 0 wrong of 138,045 |
-| 16-byte entries (24 cards), FIFO | 320 KB | 52.8 | 59.2M | 0 wrong of 150,445 |
-| 32-byte entries, eviction by depth (read from entries) | 288 KB | 54.3 | 35.0M | 0 wrong of 148,981 |
-| **16-byte entries (29 cards), eviction by depth (default)** | 320 KB | **59.9** | 37.6M | 0 wrong of 164,366 |
-| **12-byte hash entries, eviction by depth (`-DDD_TT_SIG`)** | 256 KB | **62.8** | 24.7M | 0 wrong of 169,729 |
-
-The card limit of the exact entry costs a lot once eviction keeps deep entries: 32-byte
-entries with eviction and the same 29-card limit need exactly as many nodes as the default.
-
-Search state in global memory instead of local memory (same box, 32,768 threads, TT_LOG2=10):
-
-| Build | Full deals/s, local state | Full deals/s, global state | 8-card endings/s | Check |
-|---|---|---|---|---|
-| Default | 58.8 | **64.7-66.2** | 10,516 -> 11,753 | 0 wrong of 176,672 |
-| `-DDD_TT_SIG` | 62.8 | **67.7** | 11,310 | 0 wrong of 182,060 |
-
-With global state, fewer threads with a bigger TT is slower again (16,384 x TT_LOG2=11: 64.6;
-8,192 x 12: 48.6). Streaming (`dd_stream bench 30`): 13.5 -> 17.5 deals/s over 30 s.
-
-Profile of the wavefront kernel on full deals (`-DDD_PROFILE`; Nsight Compute could not be
-used because the vast.ai container blocks GPU performance counters, `ERR_NVGPUCTRPERM`):
-
-| Stage | Share of warp cycles | Active lanes of 32 |
-|---|---|---|
-| ENTER (bounds, TT probe, move list) | 65% | 32.0 |
-| NEXT (play next move) | 15% | 10.0 |
-| RET (undo, cut test, TT store) | 20% | 3.8 |
-
-ENTER exits: full move list 73%, TT hit 22%, quick tricks 1.3%, trivial 1.7%, others < 1.5%.
-The wavefront works (ENTER always runs with all 32 lanes). The cheap stages run with few
-lanes, but running them back to back (`CHEAP_LOOP=1`) gave the same speed (44.2 vs 43.7
-deals/s), so their cost is memory latency (frames in local memory, TT stores), not
-scheduling. Per-thread search state is ~3.4 KB, ~110 MB at 32,768 threads, more than L2.
-
-Single-thread CPU vs DDS (endplay's libdds, SolveBoard per leader): this solver needs
-about 2-2.5x more cycles than DDS on full deals.
-
-Other findings:
-
-- Sharing the TT across deals on one CPU thread gives almost no gain (same node count, -7%
-  cycles): positions rarely repeat across deals.
-- Starting from a perfect guess of the trick count (as a neural net might give) saves only
-  ~16% cycles (off-by-one guess: ~7%), because the TT makes the extra null-window searches
-  cheap.
-- One job per lead without TT sharing costs 1.8x total work on the CPU.
-- The shared GPU TT is slower, likely because of random access into one 9.7 GB table,
-  in-place replacement (+20% nodes on CPU) and checksum overhead.
-
-## Known limits and next steps
-
-- **Long tail.** A single hard job can run 10+ minutes on one GPU thread. A fixed batch
-  ends with a tail where few threads are busy; the streaming mode avoids that.
-- **TT sharing.** Solving each lead as its own job (no TT shared between the four leads)
-  costs 1.8x. A shared lock-free TT across threads works (`-DDD_SHARED_TT`) but is slower
-  on the GPU (see Results).
-- **Memory-bound.** The kernel mostly waits on memory (see the profile). The next real gain
-  would come from less memory traffic per node: a smaller per-thread search state (fewer
-  and smaller frames, keeping the hot parts in registers) or a cheaper TT layout.
-- Ideas: splitting ENTER into sub-stages (only ~27% of ENTER calls leave early, so the gain
-  is limited); hardest-first scheduling.
-- CUDA reserves `cudaLimitStackSize` for all resident threads, so a large `STACK_KB`
-  wastes memory. The iterative search needs about 4 KB.
+- **Long tail.** A single hard job can run for minutes on one GPU thread. A fixed batch ends
+  with few threads busy; the streaming mode avoids that.
+- **Memory-bound.** The kernel mostly waits on memory (TT probes and per-thread state). The
+  TT per thread is small (~256-320 KB), which costs nodes compared to a CPU with a large
+  cached TT.
+- **Exact entries** skip results with more than 29 relevant cards; `-DDD_TT_SIG` has no such
+  limit.
+- CUDA reserves `cudaLimitStackSize` for all resident threads, so keep `STACK_KB` small.
 
 ## Data and credits
 

@@ -19,7 +19,7 @@ ARCH=\$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr 
 nvcc -O3 -std=c++17 -arch=sm_\$ARCH -Xptxas -v -o dd_gpu gpu_main.cu 2>&1 | grep -E "_kernel|stack frame" | head -4
 
 echo "== endings (checked against the CPU on the same box)"
-WAVE=1 STACK_KB=8 ./dd_gpu 8 20000 9 300
+WAVE=1 STACK_KB=8 ./dd_gpu 8 20000 10 300
 echo "== full deals, 120 s (checked against the Pgx tables)"
 WAVE=1 STACK_KB=8 TIME_LIMIT=120 ./dd_gpu deals_20k.npy 0 20000 | grep -v "jobs done"
 EOF
