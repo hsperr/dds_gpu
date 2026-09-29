@@ -38,7 +38,10 @@ header-only core also builds for the CPU, which is how it is tested.
   DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`), kept close to the
   original so the two can be compared.
 - **Explicit-stack search.** The depth-first search is a loop over an array of small frames
-  instead of recursion, so a GPU thread needs only a few KB of stack.
+  instead of recursion, so a GPU thread needs only a few KB of stack. On the GPU the
+  wavefront state (frames, context, ~4 KB) lives in global memory, one contiguous block per
+  thread: in local memory CUDA interleaves it across threads in 4-byte words, so threads at
+  different depths touch many more sectors per frame (+13% full deals/s).
 - **Wavefront kernel.** The search is also written as a resumable stage machine
   (`src/dd_wave.h`). In the wavefront kernel each warp runs one stage at a time for all its
   threads: the cheap stages first (RET: a child returned; NEXT: play the next move; ROOT
@@ -277,6 +280,16 @@ there vs 59.5 above), 120 s of full deals, 32,768 threads. Nodes: CPU, first 8 d
 
 The card limit of the exact entry costs a lot once eviction keeps deep entries: 32-byte
 entries with eviction and the same 29-card limit need exactly as many nodes as the default.
+
+Search state in global memory instead of local memory (same box, 32,768 threads, TT_LOG2=10):
+
+| Build | Full deals/s, local state | Full deals/s, global state | 8-card endings/s | Check |
+|---|---|---|---|---|
+| Default | 58.8 | **64.7-66.2** | 10,516 -> 11,753 | 0 wrong of 176,672 |
+| `-DDD_TT_SIG` | 62.8 | **67.7** | 11,310 | 0 wrong of 182,060 |
+
+With global state, fewer threads with a bigger TT is slower again (16,384 x TT_LOG2=11: 64.6;
+8,192 x 12: 48.6). Streaming (`dd_stream bench 30`): 13.5 -> 17.5 deals/s over 30 s.
 
 Profile of the wavefront kernel on full deals (`-DDD_PROFILE`; Nsight Compute could not be
 used because the vast.ai container blocks GPU performance counters, `ERR_NVGPUCTRPERM`):

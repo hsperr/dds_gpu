@@ -48,9 +48,13 @@ struct StreamCtl {
 __global__ void stream_kernel(const uint64_t* hands, int* out, unsigned* deal_done,
                               const unsigned* work, long work_ring, unsigned* comp,
                               long comp_ring, volatile StreamCtl* ctl, DDBucket* tt, int tt_log2,
-                              unsigned long long* next, unsigned long long* nodes, int jpd) {
+                              unsigned long long* next, unsigned long long* nodes, int jpd,
+                              DDWave* waves) {
   long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  DDWave w;
+  // Search state in global memory, one contiguous block per thread. In local memory CUDA
+  // interleaves it across threads in 4-byte words, so a frame read by threads at different
+  // depths touches ~6x more sectors (+13% full deals/s measured).
+  DDWave& w = waves[tid];
   memset(&w.c, 0, sizeof(w.c));
 #ifdef DD_SHARED_TT
   w.c.tt = tt;  // one TT for all threads (cleared by the host), 2^tt_log2 buckets
@@ -269,10 +273,12 @@ int main(int argc, char** argv) {
       });
   }
 
+  DDWave* d_waves;
+  CK(cudaMalloc(&d_waves, (size_t)threads * sizeof(DDWave)));
   int block = 64;
   stream_kernel<<<threads / block, block>>>(d_hands, d_out, d_deal_done, d_work, work_ring,
                                             d_comp, comp_ring, d_ctl, d_tt, tt_log2, d_next,
-                                            d_nodes, jpd);
+                                            d_nodes, jpd, d_waves);
   CK(cudaGetLastError());
 
   // Consumer: takes finished deals as they come and frees their slots.

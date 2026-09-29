@@ -61,9 +61,12 @@ __device__ unsigned long long g_prof[32];
 __global__ void wave_kernel(const uint64_t* hands, long jobs, DDBucket* tt, int tt_log2,
                             int* out, unsigned long long* nodes, unsigned long long* next,
                             volatile unsigned long long* done, volatile int* stop,
-                            int cheap_loop) {
+                            int cheap_loop, DDWave* waves) {
   long tid = blockIdx.x * (long)blockDim.x + threadIdx.x;
-  DDWave w;
+  // Search state in global memory, one contiguous block per thread. In local memory CUDA
+  // interleaves it across threads in 4-byte words, so a frame read by threads at different
+  // depths touches ~6x more sectors (+13% full deals/s measured).
+  DDWave& w = waves[tid];
   memset(&w.c, 0, sizeof(w.c));
   w.c.tt = tt + ((size_t)tid << tt_log2);
   w.c.tt_mask = (1u << tt_log2) - 1;
@@ -245,8 +248,10 @@ int main(int argc, char** argv) {
     CK(cudaMemset(d_out, 0xff, n * 20 * sizeof(int)));  // -1 = not solved (time limit)
     int cheap_loop = getenv("CHEAP_LOOP") && atoi(getenv("CHEAP_LOOP"));
     printf("cheap stages %s\n", cheap_loop ? "run back to back" : "one step per round");
+    DDWave* d_waves;
+    CK(cudaMalloc(&d_waves, (size_t)threads * sizeof(DDWave)));
     wave_kernel<<<grid, block>>>(d_hands, jobs, d_tt, tt_log2, d_out, d_nodes, d_next, d_done,
-                                 d_stop, cheap_loop);
+                                 d_stop, cheap_loop, d_waves);
     auto p0 = std::chrono::steady_clock::now();
     double next_print = 10;
     while (cudaStreamQuery(0) == cudaErrorNotReady) {
