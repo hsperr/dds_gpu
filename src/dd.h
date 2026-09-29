@@ -91,18 +91,52 @@ struct DDCtx {
   int enter_exit;  // where the last dd_enter returned (profiling)
 };
 
-// One suit's remaining cards, high to low, as 2-bit owners behind a leading 1 bit.
-DD_FN uint64_t dd_suit_code(const DDCtx& c, int s) {
-  uint64_t code = 1;
-  uint64_t h1 = c.hand[1] & DD_SUIT(s), h2 = c.hand[2] & DD_SUIT(s), h3 = c.hand[3] & DD_SUIT(s);
-  uint64_t all = (c.hand[0] & DD_SUIT(s)) | h1 | h2 | h3;
-  while (all) {
-    uint64_t bit = 1ull << dd_msb(all);
-    int owner = (h1 & bit) ? 1 : (h2 & bit) ? 2 : (h3 & bit) ? 3 : 0;
-    code = (code << 2) | (uint64_t)owner;
-    all ^= bit;
+// Moves the bits of x1 and x2 selected by m to the low end of each suit's 16 bits, in
+// order (Hacker's Delight compress, 16-bit lanes: prefix sums stay inside a lane).
+DD_FN void dd_compress(uint64_t& x1, uint64_t& x2, uint64_t m) {
+  x1 &= m;
+  x2 &= m;
+  uint64_t mk = (~m << 1) & 0xFFFEFFFEFFFEFFFEull;  // zeros of m below each bit
+  for (int i = 0; i < 4; i++) {
+    uint64_t mp = mk ^ ((mk << 1) & 0xFFFEFFFEFFFEFFFEull);
+    mp ^= (mp << 2) & 0xFFFCFFFCFFFCFFFCull;
+    mp ^= (mp << 4) & 0xFFF0FFF0FFF0FFF0ull;
+    mp ^= (mp << 8) & 0xFF00FF00FF00FF00ull;
+    uint64_t mv = mp & m;  // bits that move 2^i down in this round
+    m = (m ^ mv) | (mv >> (1 << i));
+    uint64_t t = x1 & mv;
+    x1 = (x1 ^ t) | (t >> (1 << i));
+    t = x2 & mv;
+    x2 = (x2 ^ t) | (t >> (1 << i));
+    mk &= ~mp;
   }
-  return code;
+}
+
+// Interleaves the low and high 16 bits of each 32-bit half: low half to even bits.
+DD_FN uint64_t dd_shuffle(uint64_t x) {
+  uint64_t t = (x ^ (x >> 8)) & 0x0000FF000000FF00ull;
+  x ^= t ^ (t << 8);
+  t = (x ^ (x >> 4)) & 0x00F000F000F000F0ull;
+  x ^= t ^ (t << 4);
+  t = (x ^ (x >> 2)) & 0x0C0C0C0C0C0C0C0Cull;
+  x ^= t ^ (t << 2);
+  t = (x ^ (x >> 1)) & 0x2222222222222222ull;
+  return x ^ t ^ (t << 1);
+}
+
+// Each suit's remaining cards, high to low, as 2-bit owners behind a leading 1 bit.
+// Owner bit 0 = held by E or W, bit 1 = by S or W; the cards of a suit are packed
+// together (dd_compress) and the two owner bits interleaved (dd_shuffle). No loop over cards.
+DD_FN void dd_suit_codes(const DDCtx& c, uint64_t* code) {
+  uint64_t all = c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3];
+  uint64_t b0 = c.hand[1] | c.hand[3], b1 = c.hand[2] | c.hand[3];
+  dd_compress(b0, b1, all);
+  const uint64_t lo = 0x0000FFFF0000FFFFull;
+  uint64_t s02 = dd_shuffle((b0 & lo) | ((b1 & lo) << 16));    // suits 0, 2
+  uint64_t s13 = dd_shuffle(((b0 >> 16) & lo) | (b1 & ~lo));  // suits 1, 3
+  uint64_t pairs[4] = {s02, s13, s02 >> 32, s13 >> 32};
+  for (int s = 0; s < 4; s++)
+    code[s] = (pairs[s] & 0x3FFFFFF) | (1ull << (2 * dd_popc(all & DD_SUIT(s))));
 }
 
 DD_FN uint64_t dd_lengths(const DDCtx& c) {
@@ -165,7 +199,7 @@ struct DDNode {  // trick-start data kept for the TT store
 };
 
 DD_FN void dd_node_init(const DDCtx& c, DDNode& nd) {
-  for (int s = 0; s < 4; s++) nd.code[s] = dd_suit_code(c, s);
+  dd_suit_codes(c, nd.code);
   nd.lens = dd_lengths(c);
   nd.all = c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3];
   uint64_t h = dd_hash(nd.lens, c.leader);
