@@ -237,6 +237,16 @@ More threads in flight beat a bigger TT per thread: the kernel waits on memory, 
 warps hide more of that latency. With the new defaults, 8-card endings run at 12,454 deals/s
 (0 wrong of 6,000 checked against the CPU).
 
+RTX 4070 Ti SUPER, defaults, 120 s of full deals:
+
+| Version | Full deals/s | 8-card endings/s | Check |
+|---|---|---|---|
+| Before | 47.2 | 9,069 | 0 wrong of 136,248 |
+| TT store shifts only the tag line | 51.6 | 10,502 | 0 wrong of 147,694 |
+| + owners, suit codes, TT probe, move skips with bit operations (no loops over cards) | **59.5** | **13,299** | 0 wrong of 168,668 |
+
+Node counts are the same in all three; only the work per node changed.
+
 Profile of the wavefront kernel on full deals (`-DDD_PROFILE`; Nsight Compute could not be
 used because the vast.ai container blocks GPU performance counters, `ERR_NVGPUCTRPERM`):
 
