@@ -62,7 +62,9 @@ struct DDEntry {
 };
 
 // Tags come first so a probe reads one 64-byte line unless a tag matches.
-//   tag: hash bits (24) | gen (6) | leader (2); 0 = empty
+//   tag: hash bits (20) | way of its entry (4) | gen (6) | leader (2); 0 = empty.
+// Tags are kept newest first; entries stay in place, so a store rewrites one 64-byte line
+// of tags instead of moving the whole bucket.
 struct DDBucket {
   uint32_t tag[DD_TT_WAYS];
   DDEntry e[DD_TT_WAYS];
@@ -163,7 +165,7 @@ DD_FN void dd_node_init(const DDCtx& c, DDNode& nd) {
   nd.all = c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3];
   uint64_t h = dd_hash(nd.lens, c.leader);
   nd.bucket = c.tt + (h & c.tt_mask);
-  nd.tag = ((uint32_t)(h >> 32) & 0xFFFFFF00u) | (DD_KEY(c) << 2) | (uint32_t)c.leader;
+  nd.tag = ((uint32_t)(h >> 32) & 0xFFFFF000u) | (DD_KEY(c) << 2) | (uint32_t)c.leader;
 }
 
 #ifdef DD_SHARED_TT
@@ -244,8 +246,9 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
 DD_FN int dd_tt_probe(const DDCtx& c, const DDNode& nd, int need, uint64_t* rel, int* best) {
   uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
   for (int i = 0; i < DD_TT_WAYS; i++) {
-    if (nd.bucket->tag[i] != nd.tag) continue;
-    const DDEntry& e = nd.bucket->e[i];
+    uint32_t t = nd.bucket->tag[i];
+    if ((t & ~0xF00u) != nd.tag) continue;
+    const DDEntry& e = nd.bucket->e[(t >> 8) & 15];
     if ((e.meta & 0xFF) != tag || e.lens != nd.lens) continue;
     uint64_t p[4] = {e.pat0 & 0x7FFFFFF, e.pat0 >> 27, e.pat1 & 0x7FFFFFF, e.pat1 >> 27};
     bool match = true;
@@ -281,8 +284,9 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
   uint64_t tag = ((uint64_t)DD_KEY(c)) | ((uint64_t)c.leader << DD_GEN_BITS);
   DDBucket* b = nd.bucket;
   for (int i = 0; i < DD_TT_WAYS; i++) {
-    if (b->tag[i] != nd.tag) continue;
-    DDEntry& e = b->e[i];
+    uint32_t t = b->tag[i];
+    if ((t & ~0xF00u) != nd.tag) continue;
+    DDEntry& e = b->e[(t >> 8) & 15];
     if ((e.meta & 0xFF) == tag && e.lens == nd.lens && e.pat0 == pat0 && e.pat1 == pat1) {
       int olb = (int)(e.meta >> 8) & 15, oub = (int)(e.meta >> 12) & 15;
       if (olb > lb) lb = olb;
@@ -296,19 +300,26 @@ DD_FN void dd_tt_store(DDCtx& c, const DDNode& nd, uint64_t rel, int lb, int ub,
       return;
     }
   }
-  // New entries go in front; the last way falls out.
-  for (int i = DD_TT_WAYS - 1; i > 0; i--) {
-    b->tag[i] = b->tag[i - 1];
-    b->e[i] = b->e[i - 1];
+  // New tags go in front; the last tag falls out and its entry way is reused. Tags are
+  // never cleared one by one, so while the bucket is not full the used ways are 0..n-1.
+  uint32_t last = b->tag[DD_TT_WAYS - 1];
+  int way;
+  if (last) {
+    way = (last >> 8) & 15;
+  } else {
+    way = 0;
+    while (b->tag[way]) way++;
   }
-  b->tag[0] = nd.tag;
-  b->e[0].pat0 = pat0;
-  b->e[0].pat1 = pat1;
-  b->e[0].lens = nd.lens;
-  b->e[0].meta = tag | ((uint64_t)lb << 8) | ((uint64_t)ub << 12) | ((uint64_t)(best + 1) << 16);
+  for (int i = DD_TT_WAYS - 1; i > 0; i--) b->tag[i] = b->tag[i - 1];
+  b->tag[0] = nd.tag | ((uint32_t)way << 8);
+  DDEntry& e = b->e[way];
+  e.pat0 = pat0;
+  e.pat1 = pat1;
+  e.lens = nd.lens;
+  e.meta = tag | ((uint64_t)lb << 8) | ((uint64_t)ub << 12) | ((uint64_t)(best + 1) << 16);
 #ifdef DD_VERIFY
-  for (int h = 0; h < 4; h++) b->e[0].dbg_hand[h] = c.hand[h];
-  b->e[0].dbg_rel = rel; b->e[0].dbg_leader = c.leader; b->e[0].dbg_lb = lb; b->e[0].dbg_ub = ub;
+  for (int h = 0; h < 4; h++) e.dbg_hand[h] = c.hand[h];
+  e.dbg_rel = rel; e.dbg_leader = c.leader; e.dbg_lb = lb; e.dbg_ub = ub;
 #endif
 }
 

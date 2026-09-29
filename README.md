@@ -16,7 +16,9 @@ header-only core also builds for the CPU, which is how it is tested.
   suit (relative ranks, not absolute) plus the exact suit lengths of every hand, so one entry
   covers many positions. Small cards below the lowest relevant card of a suit are treated
   as equal, so only one of them is tried. Buckets are 16-way with 32-bit tags stored first,
-  so a probe normally touches one 64-byte line.
+  so a probe normally touches one 64-byte line. Tags are kept newest first and each tag
+  names the way of its entry, so a store shifts only the tag line, not the whole bucket
+  (+9% full deals/s, +22% on 8-card endings on an RTX 4070 Ti SUPER; same node counts).
 - **DDS bounds and move ordering.** QuickTricks, QuickTricksSecondHand, LaterTricks and the
   DDS move-ordering weights are ported from DDS (`src/dd_bounds.h`), kept close to the
   original so the two can be compared.
