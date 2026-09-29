@@ -46,6 +46,11 @@ DD_FN int dd_lsb(uint64_t x) {  // x != 0
 }
 
 #define DD_SUIT(s) (0x1FFFull << (16 * (s)))
+
+// Seat holding `card`, without a search over the hands (0 if no hand holds it).
+DD_FN int dd_owner(const uint64_t* hand, int card) {
+  return (int)((hand[1] >> card & 1) | (hand[2] >> card & 1) << 1 | (hand[3] >> card & 1) * 3);
+}
 #define DD_TT_WAYS 16
 #define DD_GEN_BITS 6
 
@@ -428,10 +433,8 @@ DD_FN int dd_enter(DDCtx& c, int target, DDNode& nd, DDFrame& f, uint64_t* rel) 
       uint64_t in = (c.hand[0] | c.hand[1] | c.hand[2] | c.hand[3]) & DD_SUIT(s);
       int top = dd_msb(in);
       if (dd_popc(in) >= 2) *rel = 1ull << top;
-      int w = 0;
-      while (!(c.hand[w] & (1ull << top))) w++;
       c.enter_exit = 1;
-      return (w & 1) == 0 ? 1 : 0;
+      return (dd_owner(c.hand, top) & 1) == 0 ? 1 : 0;
     }
     dd_node_init(c, nd);
 #ifdef DD_VERIFY

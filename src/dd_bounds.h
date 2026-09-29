@@ -21,14 +21,11 @@ DD_FN void dd_top_init(DDTop& t, const uint64_t* hand) {
     uint64_t a = (hand[0] | hand[1] | hand[2] | hand[3]) & DD_SUIT(s);
     int8_t* hs[3] = {&t.win_h[s], &t.sec_h[s], &t.thr_h[s]};
     int8_t* cs[3] = {&t.win_c[s], &t.sec_c[s], &t.thr_c[s]};
-    for (int i = 0; i < 3; i++) {
-      if (!a) { *hs[i] = -1; *cs[i] = 0; continue; }
-      int card = dd_msb(a);
-      a ^= 1ull << card;
-      int h = 0;
-      while (!(hand[h] & (1ull << card))) h++;
-      *hs[i] = (int8_t)h;
+    for (int i = 0; i < 3; i++) {  // no branch on a suit running out: card 0, hand -1
+      int card = a ? dd_msb(a) : 0;
+      *hs[i] = (int8_t)(a ? dd_owner(hand, card) : -1);
       *cs[i] = (int8_t)card;
+      a &= ~(1ull << card);
     }
   }
 }
@@ -729,10 +726,7 @@ DD_FN int dd_lo(uint64_t m) { return m ? (dd_lsb(m) & 15) + 2 : 0; }
 DD_FN int dd_kth_hand(const uint64_t* th, uint64_t m, int k) {
   for (int i = 0; i < k && m; i++) m ^= 1ull << dd_msb(m);
   if (!m) return -1;
-  uint64_t b = 1ull << dd_msb(m);
-  for (int h = 0; h < 4; h++)
-    if (th[h] & b) return h;
-  return -1;
+  return dd_owner(th, dd_msb(m));
 }
 
 // Per-position data for dd_follow_weight, computed once per node.
